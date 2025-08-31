@@ -1,0 +1,1146 @@
+Skip to content
+You said:
+draft me up everything i need on git hub in my folder for a personal project (folder structure)
+ChatGPT said:
+
+Thought for 39s
+Here’s a complete, sane GitHub-ready repo layout. Drop this in as your project root.
+
+your-project/
+├─ .github/
+│  ├─ workflows/
+│  │  ├─ ci.yml                  # lint + test on push/PR
+│  │  ├─ release.yml             # tagged releases
+│  │  └─ codeql.yml              # code scanning (optional)
+│  ├─ ISSUE_TEMPLATE/
+│  │  ├─ bug_report.md
+│  │  ├─ feature_request.md
+│  │  └─ config.yml
+│  ├─ PULL_REQUEST_TEMPLATE.md
+│  ├─ dependabot.yml
+│  ├─ FUNDING.yml                # optional
+│  └─ CODEOWNERS                 # reviewers by path
+├─ .gitignore
+├─ .gitattributes
+├─ .editorconfig
+├─ LICENSE
+├─ README.md
+├─ CHANGELOG.md                  # keepachangelog.com format
+├─ CONTRIBUTING.md
+├─ CODE_OF_CONDUCT.md
+├─ SECURITY.md
+├─ SUPPORT.md
+├─ .env.example                  # sample env vars
+├─ docs/
+│  ├─ index.md
+│  ├─ getting-started.md
+│  ├─ architecture.md
+│  └─ adr/                       # decision records
+├─ src/                          # app/library source
+│  └─ your_module_or_app/
+├─ tests/                        # unit/integration tests
+│  └─ ...
+├─ examples/                     # small runnable examples
+├─ scripts/                      # developer scripts (cross-plat)
+│  ├─ setup.sh
+│  ├─ setup.ps1
+│  ├─ lint.sh
+│  ├─ lint.ps1
+│  ├─ test.sh
+│  ├─ test.ps1
+│  └─ release.ps1
+├─ tools/                        # internal CLIs, codegen
+│  └─ pre-commit-config.yaml
+├─ configs/
+│  ├─ app.example.yaml
+│  └─ logging.yaml
+├─ docker/
+│  ├─ Dockerfile
+│  └─ compose.yml
+├─ installers/                   # packaging for end users
+│  ├─ windows/
+│  │  ├─ wix/                    # MSI via WiX toolset
+│  │  ├─ inno/                   # Inno Setup scripts
+│  │  └─ nsis/                   # NSIS scripts
+│  ├─ macos/
+│  │  ├─ app_bundle/
+│  │  └─ pkg/
+│  └─ linux/
+│     ├─ deb/
+│     ├─ rpm/
+│     └─ appimage/
+├─ assets/
+│  ├─ logo/
+│  └─ screenshots/
+├─ build/                        # intermediate build outputs (gitignored)
+├─ dist/                         # release artifacts (gitignored)
+├─ .vscode/
+│  ├─ settings.json
+│  └─ extensions.json
+├─ .devcontainer/
+│  ├─ devcontainer.json
+│  └─ Dockerfile
+├─ Makefile                      # simple: lint, test, build, release
+└─ Taskfile.yml                  # alt to Makefile for Windows users
+Language add-ons (add only what you use):
+
+Python: pyproject.toml, requirements.txt or requirements/, ruff.toml, pytest.ini, .pylintrc
+
+Node/TypeScript: package.json, tsconfig.json, eslint.config.js, prettier.config.js, vitest.config.ts
+
+.NET: YourProject.sln, src/YourProject/*.csproj, Directory.Build.props, Directory.Build.targets
+
+Go: go.mod, go.sum, cmd/yourapp/main.go, internal/, pkg/
+
+Rust: Cargo.toml, Cargo.lock, src/main.rs, src/lib.rs
+
+Minimal CI stubs (filenames as above):
+
+ci.yml: checkout → setup toolchain → cache deps → lint → test → build
+
+release.yml: on tag v* → build → create GitHub Release → upload artifacts
+
+codeql.yml: default CodeQL for your language
+
+That’s the full scaffold. If you want this specialized for Python or Node now, say which stack and I’ll fill the files.
+
+You said:
+[
+	{
+		"path": "readme.md",
+		"required": true,
+		"description": "Cockpit-polished README for GitHub deployment"
+	},
+	{
+		"path": "readme2.md",
+		"required": false,
+		"description": "Secondary README or extended documentation"
+	},
+	{
+		"path": "requirements.txt",
+		"required": true,
+		"description": "Dependency list for runtime environment"
+	},
+	{
+		"path": ".gitignore",
+		"required": true,
+		"description": "Excludes cache, binaries, and large files from version control"
+	},
+	{
+		"path": "release_notes.md",
+		"required": false,
+		"description": "Version history and cockpit evolution log"
+	}
+]
+
+i already have these in my folder, update the strcuture to include these
+
+[
+	{
+		"path": "readme.md",
+		"required": true,
+		"description": "Cockpit-polished README for GitHub deployment"
+	},
+	{
+		"path": "readme2.md",
+		"required": false,
+		"description": "Secondary README or extended documentation"
+	},
+	{
+		"path": "requirements.txt",
+		"required": true,
+		"description": "Dependency list for runtime environment"
+	},
+	{
+		"path": ".gitignore",
+		"required": true,
+		"description": "Excludes cache, binaries, and large files from version control"
+	},
+	{
+		"path": "release_notes.md",
+		"required": false,
+		"description": "Version history and cockpit evolution log"
+	}
+]
+
+{
+  "core_files": [
+    "launch_gui.py",
+    "config/core_manifest.json",
+    "config/module_manifest.json",
+    "src/gui/main_window.py",
+    "src/gui/__init__.py",
+    "src/gui/widgets/__init__.py",
+    "src/modules/preflight_check.py",
+    "src/modules/refiner_module.py",
+    "src/modules/version_check.py",
+    "src/modules/upscale_module.py",
+    "src/modules/__init__.py",
+    "src/modules/utils/__init__.py",
+    "src/modules/utils/checkpoint_validator.py",
+    "src/modules/utils/telemetry.py",
+    "src/config/config_paths.py",
+    "src/config/__init__.py",
+    "src/models/__init__.py",
+    "src/models/sd3_5_tensorrt/__init__.py",
+    "src/logs/__init__.py",
+    "src/audit/__init__.py",
+    "src/data/__init__.py",
+    "src/archiver/__init__.py",
+    "src/__init__.py",
+    "Scripts/model_size_audit.py",
+    "Scripts/size_audit.py",
+    "Scripts/log_push.py",
+    "Scripts/purge_non_manifest.py",
+    "Scripts/__init__.py",
+    "outputs/refined/refiner_config.json",
+    "outputs/images/refined/refiner_config.json"
+  ],
+  "cosmos_modules": [
+    "src/nodes/__init__.py",
+    "src/nodes/my_model_defs.py",
+    "src/nodes/ops.py",
+    "src/nodes/cosmos/__init__.py",
+    "src/nodes/cosmos/blocks.py",
+    "src/nodes/cosmos/model.py",
+    "src/nodes/cosmos/position_embedding.py",
+    "src/nodes/cosmos/predict2.py",
+    "src/nodes/cosmos/vae.py",
+    "src/nodes/cosmos_text_to_video.py",
+    "src/nodes/cosmos/cosmos_tokenizer/__init__.py",
+    "src/nodes/cosmos/cosmos_tokenizer/layers3d.py",
+    "src/nodes/cosmos/cosmos_tokenizer/patching.py",
+    "src/nodes/cosmos/cosmos_tokenizer/utils.py"
+  ],
+  "assets": [
+    "src/data/poweredbynvidia_optimized.png"
+  ],
+  "utils": [
+    "src/utils/"
+  ],
+  "logs": [
+    "logs/"
+  ],
+  "excluded_folders": [
+    {
+      "folder": "models/",
+      "included": false,
+      "reason": "Ignored in Git due to large model weights",
+      "audit_log": "logs/model_log.json",
+      "last_audit": "2025-08-29T23:08:00+01:00",
+      "total_files_flagged": 42,
+      "largest_file_MB": 15945.49,
+      "notes": "Folder retained for GUI structure and manifest clarity. Contents excluded from version control."
+    },
+    { "folder": "env", "included": false },
+    { "folder": "cockpit_env", "included": false },
+    { "folder": ".venv", "included": false },
+    { "folder": ".vs", "included": false },
+    { "folder": "__pycache__", "included": false }
+  ]
+}
+
+without breaking folder strcuture of my original items
+ChatGPT said:
+
+Thought for 52s
+Updated repo layout. Your existing files and paths stay unchanged.
+
+your-project/
+├─ readme.md
+├─ readme2.md
+├─ requirements.txt
+├─ .gitignore
+├─ release_notes.md
+├─ launch_gui.py
+├─ config/
+│  ├─ core_manifest.json
+│  └─ module_manifest.json
+├─ src/
+│  ├─ __init__.py
+│  ├─ gui/
+│  │  ├─ __init__.py
+│  │  ├─ main_window.py
+│  │  └─ widgets/
+│  │     └─ __init__.py
+│  ├─ modules/
+│  │  ├─ __init__.py
+│  │  ├─ preflight_check.py
+│  │  ├─ refiner_module.py
+│  │  ├─ version_check.py
+│  │  ├─ upscale_module.py
+│  │  └─ utils/
+│  │     ├─ __init__.py
+│  │     ├─ checkpoint_validator.py
+│  │     └─ telemetry.py
+│  ├─ config/
+│  │  ├─ __init__.py
+│  │  └─ config_paths.py
+│  ├─ models/
+│  │  ├─ __init__.py
+│  │  └─ sd3_5_tensorrt/
+│  │     └─ __init__.py
+│  ├─ logs/
+│  │  └─ __init__.py
+│  ├─ audit/
+│  │  └─ __init__.py
+│  ├─ data/
+│  │  ├─ __init__.py
+│  │  └─ poweredbynvidia_optimized.png
+│  ├─ archiver/
+│  │  └─ __init__.py
+│  ├─ nodes/
+│  │  ├─ __init__.py
+│  │  ├─ my_model_defs.py
+│  │  ├─ ops.py
+│  │  ├─ cosmos_text_to_video.py
+│  │  └─ cosmos/
+│  │     ├─ __init__.py
+│  │     ├─ blocks.py
+│  │     ├─ model.py
+│  │     ├─ position_embedding.py
+│  │     ├─ predict2.py
+│  │     ├─ vae.py
+│  │     └─ cosmos_tokenizer/
+│  │        ├─ __init__.py
+│  │        ├─ layers3d.py
+│  │        ├─ patching.py
+│  │        └─ utils.py
+│  └─ utils/                      # (placeholder if you add extras here)
+├─ Scripts/                       # keep capital S as-is
+│  ├─ __init__.py
+│  ├─ model_size_audit.py
+│  ├─ size_audit.py
+│  ├─ log_push.py
+│  └─ purge_non_manifest.py
+├─ outputs/
+│  ├─ refined/
+│  │  └─ refiner_config.json
+│  └─ images/
+│     └─ refined/
+│        └─ refiner_config.json
+├─ logs/                          # repository logs you keep
+├─ .github/
+│  ├─ workflows/
+│  │  ├─ ci.yml
+│  │  ├─ release.yml
+│  │  └─ codeql.yml
+│  ├─ ISSUE_TEMPLATE/
+│  │  ├─ bug_report.md
+│  │  ├─ feature_request.md
+│  │  └─ config.yml
+│  ├─ PULL_REQUEST_TEMPLATE.md
+│  ├─ dependabot.yml
+│  └─ CODEOWNERS
+├─ docs/
+│  ├─ index.md
+│  ├─ getting-started.md
+│  └─ architecture.md
+├─ .editorconfig
+├─ .gitattributes
+├─ .vscode/
+│  ├─ settings.json
+│  └─ extensions.json
+├─ docker/
+│  ├─ Dockerfile
+│  └─ compose.yml
+└─ installers/
+   ├─ windows/   # wix/inno/nsis as needed
+   ├─ macos/
+   └─ linux/
+.gitignore (additions that respect your exclusions while keeping the two refiner configs and audit logs):
+
+# virtual envs and IDE
+.env
+.env.*
+env/
+cockpit_env/
+.venv/
+.vscode/
+.vs/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Models and large artifacts
+models/**
+!models/.gitkeep
+
+# Build and temp
+dist/
+build/
+*.egg-info/
+
+# Outputs: ignore bulk, keep tracked configs
+outputs/**
+!outputs/refined/refiner_config.json
+!outputs/images/refined/refiner_config.json
+
+# Logs: ignore general logs, keep JSON audits
+logs/**
+!logs/*.json
+!logs/**/*.json
+CI guard for core files (drop file list into .github/workflows/ci.yml job):
+
+- name: Verify core files exist
+  run: |
+    python - <<'PY'
+paths = [
+"launch_gui.py","config/core_manifest.json","config/module_manifest.json",
+"src/gui/main_window.py","src/gui/__init__.py","src/gui/widgets/__init__.py",
+"src/modules/preflight_check.py","src/modules/refiner_module.py","src/modules/version_check.py",
+"src/modules/upscale_module.py","src/modules/__init__.py","src/modules/utils/__init__.py",
+"src/modules/utils/checkpoint_validator.py","src/modules/utils/telemetry.py",
+"src/config/config_paths.py","src/config/__init__.py","src/models/__init__.py",
+"src/models/sd3_5_tensorrt/__init__.py","src/logs/__init__.py","src/audit/__init__.py",
+"src/data/__init__.py","src/archiver/__init__.py","src/__init__.py",
+"Scripts/model_size_audit.py","Scripts/size_audit.py","Scripts/log_push.py","Scripts/purge_non_manifest.py","Scripts/__init__.py",
+"outputs/refined/refiner_config.json","outputs/images/refined/refiner_config.json",
+"src/nodes/__init__.py","src/nodes/my_model_defs.py","src/nodes/ops.py","src/nodes/cosmos/__init__.py",
+"src/nodes/cosmos/blocks.py","src/nodes/cosmos/model.py","src/nodes/cosmos/position_embedding.py",
+"src/nodes/cosmos/predict2.py","src/nodes/cosmos/vae.py","src/nodes/cosmos_text_to_video.py",
+"src/nodes/cosmos/cosmos_tokenizer/__init__.py","src/nodes/cosmos/cosmos_tokenizer/layers3d.py",
+"src/nodes/cosmos/cosmos_tokenizer/patching.py","src/nodes/cosmos/cosmos_tokenizer/utils.py"
+]
+missing = [p for p in paths if not __import__("pathlib").Path(p).exists()]
+assert not missing, f"Missing core files: {missing}"
+PY
+If you want me to generate the .github/workflows/ci.yml and a ready .gitignore file, say so.
+
+You said:
+update my ci guard from this
+
+name: CI
+
+on:
+  push:
+    branches: [ master, main, develop, feature/** ]
+  pull_request:
+    branches: [ master, main, develop ]
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: windows-latest  # change to ubuntu-latest if Linux is fine
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+            python-version: '3.10'
+
+      - name: Install core + dev deps
+        run: |
+          python -m pip install --upgrade pip
+          if exist pyproject.toml (
+            python -m pip install -e .[dev]
+          ) else (
+            python -m pip install -r requirements.txt
+          )
+
+      - name: Cache ruff & pip
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\AppData\Local\pip\Cache
+          key: pip-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            pip-${{ runner.os }}-
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Format check (ruff-format)
+        run: ruff format --check .
+
+      - name: Type check (mypy)
+        run: mypy src
+
+      - name: Run tests (pytest)
+        run: |
+          if exist tests (
+            python -m pytest -q
+          ) else (
+            echo "No tests directory; skipping."
+          )
+
+      - name: Generate SBOM
+        run: |
+          python scripts/build_sbom.py
+        continue-on-error: true
+
+      - name: Generate license report
+        run: |
+          python scripts/collect_licenses.py
+        continue-on-error: true
+
+      - name: Upload audit artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-artifacts
+          path: |
+            docs/audit/sbom.json
+            docs/audit/license_report.json
+        if: always()
+      - name: Coverage (pytest)
+        run: |
+          if exist tests (
+            python -m pip install coverage pytest-cov
+            python -m pytest
+          ) else (
+            echo "No tests directory; skipping."
+          )
+
+      - name: Upload coverage.xml
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.xml
+
+      - name: Model verification
+        run: |
+          if exist model_store (
+            python scripts/verify_models.py || echo "Model verification non-blocking (for now)"
+          ) else (
+            echo "No model_store directory."
+          )
+
+      - name: Security audit (non-blocking)
+        run: python scripts/security_audit.py || echo "Security audit step failed (non-blocking)"
+ChatGPT said:
+
+Thought for 56s
+Updated workflow with hard guards for core files, excluded folders, outputs allow-list, .gitignore invariants, and large blobs. Paths reflect your structure.
+
+name: CI
+
+on:
+  push:
+    branches: [ master, main, develop, feature/** ]
+  pull_request:
+    branches: [ master, main, develop ]
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---- Guards (fail fast) ----
+
+      - name: Guard — core files exist
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          paths = [
+            "launch_gui.py","config/core_manifest.json","config/module_manifest.json",
+            "src/gui/main_window.py","src/gui/__init__.py","src/gui/widgets/__init__.py",
+            "src/modules/preflight_check.py","src/modules/refiner_module.py","src/modules/version_check.py",
+            "src/modules/upscale_module.py","src/modules/__init__.py","src/modules/utils/__init__.py",
+            "src/modules/utils/checkpoint_validator.py","src/modules/utils/telemetry.py",
+            "src/config/config_paths.py","src/config/__init__.py","src/models/__init__.py",
+            "src/models/sd3_5_tensorrt/__init__.py","src/logs/__init__.py","src/audit/__init__.py",
+            "src/data/__init__.py","src/archiver/__init__.py","src/__init__.py",
+            "Scripts/model_size_audit.py","Scripts/size_audit.py","Scripts/log_push.py","Scripts/purge_non_manifest.py","Scripts/__init__.py",
+            "outputs/refined/refiner_config.json","outputs/images/refined/refiner_config.json",
+            "src/nodes/__init__.py","src/nodes/my_model_defs.py","src/nodes/ops.py","src/nodes/cosmos/__init__.py",
+            "src/nodes/cosmos/blocks.py","src/nodes/cosmos/model.py","src/nodes/cosmos/position_embedding.py",
+            "src/nodes/cosmos/predict2.py","src/nodes/cosmos/vae.py","src/nodes/cosmos_text_to_video.py",
+            "src/nodes/cosmos/cosmos_tokenizer/__init__.py","src/nodes/cosmos/cosmos_tokenizer/layers3d.py",
+            "src/nodes/cosmos/cosmos_tokenizer/patching.py","src/nodes/cosmos/cosmos_tokenizer/utils.py",
+            "src/data/poweredbynvidia_optimized.png",
+            "readme.md",".gitignore","requirements.txt"
+          ]
+          missing = [p for p in paths if not Path(p).exists()]
+          if missing:
+              raise SystemExit(f"Missing core files: {missing}")
+          PY
+
+      - name: Guard — excluded folders not tracked
+        shell: pwsh
+        run: |
+          $globs = @("models/**","env/**","cockpit_env/**",".venv/**",".vs/**","**/__pycache__/**")
+          $tracked = @()
+          foreach ($g in $globs) { $tracked += (git ls-files $g) }
+          if ($tracked.Count -gt 0) {
+            Write-Error "Tracked files in excluded folders:`n$($tracked -join "`n")"
+          }
+
+      - name: Guard — outputs allow-list only
+        shell: pwsh
+        run: |
+          $allowed = @(
+            "outputs/refined/refiner_config.json",
+            "outputs/images/refined/refiner_config.json"
+          )
+          $tracked = git ls-files outputs/**
+          $bad = $tracked | Where-Object { $allowed -notcontains $_ }
+          if ($bad) { Write-Error "Tracked files in outputs not allowed:`n$($bad -join "`n")" }
+
+      - name: Guard — .gitignore required patterns present
+        shell: bash
+        run: |
+          req=(
+            "models/**"
+            "outputs/**"
+            "!outputs/refined/refiner_config.json"
+            "!outputs/images/refined/refiner_config.json"
+            "env/"
+            "cockpit_env/"
+            ".venv/"
+            "__pycache__/"
+          )
+          for p in "${req[@]}"; do
+            grep -Fxq "$p" .gitignore || { echo "Missing .gitignore pattern: $p"; exit 1; }
+          done
+
+      - name: Guard — no large blobs (>100 MB) tracked
+        shell: pwsh
+        run: |
+          $files = git ls-files | ForEach-Object { Get-Item $_ } | Where-Object { $_.Length -gt 100MB }
+          if ($files) {
+            $report = $files | ForEach-Object { "$($_.FullName) -> {0:N2} MB" -f ($_.Length/1MB) } | Out-String
+            Write-Error "Large files detected:`n$report"
+          }
+
+      # ---- Tooling / build ----
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\pip\Cache
+          key: pip-${{ runner.os }}-${{ hashFiles('pyproject.toml', 'requirements.txt') }}
+          restore-keys: |
+            pip-${{ runner.os }}-
+
+      - name: Install core + dev deps
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          if (Test-Path pyproject.toml) {
+            python -m pip install -e .[dev]
+          } elseif (Test-Path requirements.txt) {
+            python -m pip install -r requirements.txt
+          }
+          python -m pip install ruff mypy pytest pytest-cov
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Format check (ruff-format)
+        run: ruff format --check .
+
+      - name: Type check (mypy)
+        run: mypy src
+
+      - name: Run tests (pytest)
+        shell: pwsh
+        run: |
+          if (Test-Path tests) {
+            python -m pytest -q
+          } else {
+            echo "No tests directory; skipping."
+          }
+
+      - name: Coverage (pytest)
+        shell: pwsh
+        run: |
+          if (Test-Path tests) {
+            python -m pytest --cov=src --cov-report=xml
+          } else {
+            echo "No tests directory; skipping."
+          }
+
+      - name: Upload coverage.xml
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.xml
+
+      - name: Generate SBOM
+        shell: pwsh
+        run: |
+          if (Test-Path Scripts\build_sbom.py) {
+            python Scripts\build_sbom.py
+          } elseif (Test-Path scripts\build_sbom.py) {
+            python scripts\build_sbom.py
+          } else {
+            echo "No SBOM script; skipping."
+          }
+        continue-on-error: true
+
+      - name: Generate license report
+        shell: pwsh
+        run: |
+          if (Test-Path Scripts\collect_licenses.py) {
+            python Scripts\collect_licenses.py
+          } elseif (Test-Path scripts\collect_licenses.py) {
+            python scripts\collect_licenses.py
+          } else {
+            echo "No license script; skipping."
+          }
+        continue-on-error: true
+
+      - name: Upload audit artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: audit-artifacts
+          path: |
+            docs/audit/sbom.json
+            docs/audit/license_report.json
+
+      - name: Model verification
+        shell: pwsh
+        run: |
+          if (Test-Path model_store) {
+            if (Test-Path Scripts\verify_models.py) { python Scripts\verify_models.py } `
+            elseif (Test-Path scripts\verify_models.py) { python scripts\verify_models.py } `
+            else { echo "verify_models.py missing"; }
+          } else {
+            echo "No model_store directory."
+          }
+
+      - name: Security audit (non-blocking)
+        shell: pwsh
+        run: |
+          if (Test-Path Scripts\security_audit.py) { python Scripts\security_audit.py } `
+          elseif (Test-Path scripts\security_audit.py) { python scripts\security_audit.py } `
+          else { echo "No security audit script; skipping." }
+        continue-on-error: true
+You said:
+# =====================================================
+# ? Preserve Git folder (safety override)
+# =====================================================
+!.git/
+
+# =====================================================
+# ?? Python Artifacts
+# =====================================================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# =====================================================
+# ?? Virtual Environments and Dependencies
+# =====================================================
+.env/
+.venv/
+env/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Preserve custom cockpit env folder
+!venc/
+
+# =====================================================
+# ?? Logs and Telemetry
+# =====================================================
+*.log
+logs/
+src/logs/
+telemetry/
+
+# =====================================================
+# ??? Media Caches (keep assets, ignore heavy cache/renders)
+# =====================================================
+cache/
+frames/
+renders/
+.cache/
+models/.cache/
+
+# Ignore all contents of output folders, but keep the folder itself
+output/**
+!output/.keep
+outputs/**
+!outputs/.keep
+
+# =====================================================
+# ?? Model Weights and Binaries (use Git LFS or external storage)
+# =====================================================
+*.pt
+*.ckpt
+*.h5
+*.tflite
+*.safetensors
+*.safetensors.index.json
+*.onnx
+*.bin
+*.pth
+weights/
+
+# =====================================================
+# ??? IDE and OS Clutter
+# =====================================================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+.vs/
+cockpit_env/
+
+# =====================================================
+# 📜 Manifests
+# =====================================================
+# Ignore root-level manifests only
+/core_manifest.json
+/upload_manifest.json
+
+
+# Explicitly track the real manifest location
+!config/core_manifest.json
+
+# =====================================================
+# 🚀 Deployment Artifacts
+# =====================================================
+*.zip
+*.tar.gz
+*.bak
+*.tmp
+*.ps1~
+*.ps1.bak
+
+# =====================================================
+# ? Auto-added Large Files (>50MB)
+# =====================================================
+env/Lib/site-packages/torch/lib/cublas64_12.dll
+env/Lib/site-packages/torch/lib/cublasLt64_12.dll
+env/Lib/site-packages/torch/lib/cudnn_adv64_9.dll
+env/Lib/site-packages/torch/lib/cudnn_engines_precompiled64_9.dll
+env/Lib/site-packages/torch/lib/cudnn_heuristic64_9.dll
+env/Lib/site-packages/torch/lib/cudnn_ops64_9.dll
+env/Lib/site-packages/torch/lib/cufft64_11.dll
+env/Lib/site-packages/torch/lib/curand64_10.dll
+env/Lib/site-packages/torch/lib/cusolver64_11.dll
+env/Lib/site-packages/torch/lib/cusolverMg64_11.dll
+env/Lib/site-packages/torch/lib/cusparse64_12.dll
+env/Lib/site-packages/torch/lib/dnnl.lib
+env/Lib/site-packages/torch/lib/torch_cpu.dll
+env/Lib/site-packages/torch/lib/torch_cuda.dll
+
+# =====================================================
+# ?? AI Models
+# =====================================================
+models/**
+!models/.keep
+.git/lfs/objects/
+
+# =====================================================
+# ?? Source Code Rules
+# =====================================================
+# Ignore everything in src
+src/*
+
+# Preserve vital init files
+!src/__init__.py
+!src/gui/__init__.py
+!src/modules/__init__.py
+!src/nodes/__init__.py
+!src/nodes/cosmos/__init__.py
+!src/models/__init__.py
+
+# Block unused module init
+src/archiver/__init__.py
+
+# =====================================================
+# ??? Local Tools and Scratch Files
+# =====================================================
+relative_file_list.txt
+tools/*.py
+
+update my gitignore if needs with these above
+
+# =====================================================
+# ? Preserve Git folder (safety override)
+# =====================================================
+!.git/
+
+# =====================================================
+# ?? Python Artifacts
+# =====================================================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# =====================================================
+# ?? Virtual Environments and Dependencies
+# =====================================================
+.env/
+.venv/
+env/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Preserve custom cockpit env folder
+!venc/
+
+# =====================================================
+# ?? Logs and Telemetry
+# =====================================================
+*.log
+logs/
+src/logs/
+telemetry/
+
+# =====================================================
+# ??? Media Caches (keep assets, ignore heavy cache/renders)
+# =====================================================
+cache/
+frames/
+renders/
+.cache/
+models/.cache/
+
+# Ignore all contents of output folders, but keep the folder itself
+output/**
+!output/.keep
+outputs/**
+!outputs/.keep
+
+# =====================================================
+# ?? Model Weights and Binaries (use Git LFS or external storage)
+# =====================================================
+*.pt
+*.ckpt
+*.h5
+*.tflite
+*.safetensors
+*.safetensors.index.json
+*.onnx
+*.bin
+*.pth
+weights/
+
+# =====================================================
+# ??? IDE and OS Clutter
+# =====================================================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+.vs/
+cockpit_env/
+
+# =====================================================
+# ?? Manifests
+# =====================================================
+# Ignore root-level manifests only
+/core_manifest.json
+/upload_manifest.json
+
+# Explicitly track the real manifest location
+!config/core_manifest.json
+
+# =====================================================
+# ?? Deployment Artifacts
+# =====================================================
+*.zip
+*.tar.gz
+*.bak
+*.tmp
+
+# =====================================================
+# ? Auto-added Large Files (>50MB)
+# =====================================================
+env/Lib/site-packages/torch/lib/cublas64_12.dll
+env/Lib/site-packages/torch/lib/cublasLt64_12.dll
+env/Lib/site-packages/torch/lib/cudnn_adv64_9.dll
+env/Lib/site-packages/torch/lib/cudnn_engines_precompiled64_9.dll
+env/Lib/site-packages/torch/lib/cudnn_heuristic64_9.dll
+env/Lib/site-packages/torch/lib/cudnn_ops64_9.dll
+env/Lib/site-packages/torch/lib/cufft64_11.dll
+env/Lib/site-packages/torch/lib/curand64_10.dll
+env/Lib/site-packages/torch/lib/cusolver64_11.dll
+env/Lib/site-packages/torch/lib/cusolverMg64_11.dll
+env/Lib/site-packages/torch/lib/cusparse64_12.dll
+env/Lib/site-packages/torch/lib/dnnl.lib
+env/Lib/site-packages/torch/lib/torch_cpu.dll
+env/Lib/site-packages/torch/lib/torch_cuda.dll
+
+# =====================================================
+# ?? AI Models
+# =====================================================
+models/**
+!models/.keep
+.git/lfs/objects/
+
+# =====================================================
+# ?? Source Code Rules
+# =====================================================
+# Ignore everything in src
+src/*
+
+# Preserve vital init files
+!src/__init__.py
+!src/gui/__init__.py
+!src/modules/__init__.py
+!src/nodes/__init__.py
+!src/nodes/cosmos/__init__.py
+!src/models/__init__.py
+
+# Block unused module init
+src/archiver/__init__.py
+
+# =====================================================
+# ??? Local Tools and Scratch Files
+# =====================================================
+relative_file_list.txt
+tools/*.py
+ChatGPT said:
+
+Thought for 20s
+Here’s a safe, corrected .gitignore. Key fixes: removed src/* blanket ignore, removed the src/archiver/__init__.py block, added allow-lists for your two outputs/.../refiner_config.json, and kept JSON audit logs.
+
+# =====================================================
+# ? Preserve Git folder (safety override)
+# Note: .git is ignored by Git itself; this line is harmless.
+# =====================================================
+!.git/
+
+# =====================================================
+# ?? Python Artifacts
+# =====================================================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Coverage
+.coverage
+coverage.xml
+htmlcov/
+
+# =====================================================
+# ?? Virtual Environments and Dependencies
+# =====================================================
+.env/
+.venv/
+env/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Preserve custom cockpit env folder
+!venc/
+
+# =====================================================
+# ?? Logs and Telemetry
+# =====================================================
+*.log
+logs/**
+!logs/*.json
+!logs/**/*.json
+src/logs/
+telemetry/
+
+# =====================================================
+# ??? Media Caches (keep assets, ignore heavy cache/renders)
+# =====================================================
+cache/
+frames/
+renders/
+.cache/
+models/.cache/
+
+# Ignore all contents of output folders, but keep the folder itself
+output/**
+!output/.keep
+outputs/**
+!outputs/.keep
+# Allow-list required tracked configs inside outputs
+!outputs/refined/
+!outputs/refined/refiner_config.json
+!outputs/images/
+!outputs/images/refined/
+!outputs/images/refined/refiner_config.json
+
+# =====================================================
+# ?? Model Weights and Binaries (use Git LFS or external storage)
+# =====================================================
+*.pt
+*.ckpt
+*.h5
+*.tflite
+*.safetensors
+*.safetensors.index.json
+*.onnx
+*.bin
+*.pth
+weights/
+
+# =====================================================
+# ??? IDE and OS Clutter
+# =====================================================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+.vs/
+cockpit_env/
+
+# =====================================================
+# ?? Manifests
+# =====================================================
+# Ignore root-level manifests only
+/core_manifest.json
+/upload_manifest.json
+# Explicitly track the real manifest location
+!config/core_manifest.json
+
+# =====================================================
+# ?? Deployment Artifacts
+# =====================================================
+*.zip
+*.tar.gz
+*.bak
+*.tmp
+
+# =====================================================
+# ? Auto-added Large Files (>50MB)
+# (Redundant with env/ ignore but left for safety)
+# =====================================================
+env/Lib/site-packages/torch/lib/cublas64_12.dll
+env/Lib/site-packages/torch/lib/cublasLt64_12.dll
+env/Lib/site-packages/torch/lib/cudnn_adv64_9.dll
+env/Lib/site-packages/torch/lib/cudnn_engines_precompiled64_9.dll
+env/Lib/site-packages/torch/lib/cudn
+
+
+No file chosenNo file chosen
+ChatGPT is still generating a response...

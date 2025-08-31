@@ -1,0 +1,24 @@
+# =====================================================
+# Line Ending Normalization
+# =====================================================
+
+# Python files — enforce LF for cross-platform consistency
+*.py text eol=lf
+
+# Shell and config files — LF only
+*.sh text eol=lf
+*.cfg text eol=lf
+*.toml text eol=lf
+
+# Windows-specific scripts — CRLF
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Catch-all fallback
+* text=auto
+
+# Optional: preserve binary integrity
+*.dll binary
+*.exe binary
+*.bin binary
+

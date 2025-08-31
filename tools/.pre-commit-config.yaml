@@ -1,0 +1,49 @@
+repos:
+  # Basic file hygiene
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: check-merge-conflict
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-yaml
+      - id: check-toml
+      - id: detect-private-key
+      - id: check-added-large-files
+        args: ["--maxkb=512"]
+
+  # Enforce you don't commit directly to master/main accidentally
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: no-commit-to-branch
+        args: [--branch, master, --branch, main]
+
+  # Ruff (lint + format)
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.5.7
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  # mypy type checking
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.10.0
+    hooks:
+      - id: mypy
+        additional_dependencies: []
+
+  # (Optional) CycloneDX SBOM generation every commit touching Python (comment out if noisy)
+  # - repo: https://github.com/CycloneDX/cyclonedx-python
+  #   rev: v4.2.1
+  #   hooks:
+  #     - id: cyclonedx-py
+  #       args: [--format, json, --output, docs/audit/cyclonedx.json]
+
+  # (Optional) Secret scanning (advanced)
+  # - repo: https://github.com/Yelp/detect-secrets
+  #   rev: v1.4.0
+  #   hooks:
+  #     - id: detect-secrets
+  #       args: ["--baseline", ".secrets.baseline"]
