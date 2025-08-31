@@ -1,0 +1,13 @@
+{
+  "files": [
+    "launch_gui.py",
+    "gui/main_window.py",
+    "modules/preflight_check.py",
+    "modules/refiner_module.py",
+    "modules/utils/telemetry.py",
+    "modules/__init__.py",
+    "modules/utils/__init__.py",
+    "config/core_manifest.json",
+    "config/module_manifest.json"
+  ]
+}
