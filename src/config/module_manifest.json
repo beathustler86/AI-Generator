@@ -1,0 +1,8 @@
+{
+  "files": [
+    "config/core_manifest.json",
+    "config/module_manifest.json",
+    "outputs/refined/refiner_config.json",
+    "outputs/images/refined/refiner_config.json"
+  ]
+}
