@@ -28,4 +28,3 @@ operations = type("Ops", (), {
     "Linear": nn.Linear,
     "sincos": SinCosEmbedding
 })
-

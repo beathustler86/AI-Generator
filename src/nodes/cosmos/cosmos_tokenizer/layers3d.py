@@ -989,4 +989,3 @@ class DecoderFactorized(nn.Module):
         h = self.conv_out(h)
         h = self.unpatcher3d(h)
         return h
-

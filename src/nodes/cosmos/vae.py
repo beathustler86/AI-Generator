@@ -155,4 +155,3 @@ class CausalContinuousVideoTokenizer(nn.Module):
         z = z * std + mean
         z = self.post_quant_conv(z)
         return self.decoder(z)
-

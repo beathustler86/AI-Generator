@@ -1,0 +1,9 @@
+-r requirements.in
+
+ruff
+yapf
+vulture
+ipykernel
+matplotlib
+datasets
+pandas

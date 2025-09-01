@@ -3,16 +3,19 @@ import json
 from pathlib import Path
 from datetime import datetime
 
-ROOT = Path(__file__).resolve().parent.parent
+from src.modules.utils.telemetry import log_event  # near top (guarded try/except if preferred)
+
+ROOT = Path(__file__).resolve().parent.parent  # project root
 CORE_MANIFEST_PATH = ROOT / "config" / "core_manifest.json"
 MODULE_MANIFEST_PATH = ROOT / "config" / "module_manifest.json"
 
+# Updated paths to reflect actual locations under src/
 FALLBACK_CORE = [
-    "launch_gui.py",
-    "gui/main_window.py",
-    "modules/preflight_check.py",
-    "modules/refiner_module.py",
-    "modules/utils/telemetry.py",
+    "src/launch_gui.py",
+    "src/gui/main_window.py",
+    "src/modules/preflight_check.py",
+    "src/modules/refiner_module.py",
+    "src/modules/utils/telemetry.py",
 ]
 
 FALLBACK_OPTIONAL = [
@@ -50,6 +53,17 @@ def _load_manifest(path: Path, fallback: list[str]) -> list[str]:
 def _normalize(rel: str) -> str:
     return rel.replace("\\", "/").lstrip("/")
 
+def _check_gui_binding() -> dict:
+    """Return which (if any) Qt bindings are importable."""
+    result = {"PySide6": False, "PyQt5": False}
+    for name in result.keys():
+        try:
+            __import__(name)
+            result[name] = True
+        except Exception:
+            pass
+    return result
+
 def run_preflight() -> dict:
     try:
         _safe_log("Preflight: verifying model checkpoints...")
@@ -83,8 +97,12 @@ def run_preflight() -> dict:
                         pass
                 missing_optional.append(str(tgt.resolve()))
 
+        gui = _check_gui_binding()
+        if not any(gui.values()):
+            missing_required.append("Qt binding (PySide6 or PyQt5) not installed")
+
         status = "complete" if not missing_required else "failed"
-        return {
+        result = {
             "status": status,
             "missing_files": missing_required + missing_optional,
             "missing_required": missing_required,
@@ -92,8 +110,13 @@ def run_preflight() -> dict:
             "core_count": len(core),
             "optional_count": len(optional),
             "auto_created_optional": auto_created,
+            "qt_bindings": gui,
             "timestamp": datetime.utcnow().isoformat(),
         }
+        log_event({"event": "preflight", "status": status,
+           "missing_required": len(missing_required),
+           "missing_optional": len(missing_optional)})
+        return result
     except Exception as e:
         return {
             "status": "failed",
@@ -104,6 +127,7 @@ def run_preflight() -> dict:
             "core_count": 0,
             "optional_count": 0,
             "auto_created_optional": [],
+            "qt_bindings": {},
             "timestamp": datetime.utcnow().isoformat(),
         }
 
@@ -112,56 +136,3 @@ __all__ = ["run_preflight"]
 if __name__ == "__main__":
     import pprint
     pprint.pp(run_preflight())
-
-def Get_TorchInfo(PythonExe):
-    code = """
-import json, os, glob, time
-try:
-    import torch
-except Exception as e:
-    print(json.dumps({"error":"torch import failed","exc":str(e)}))
-    raise SystemExit(0)
-
-info = {
-  "torch_version": torch.__version__,
-  "cuda_available": torch.cuda.is_available(),
-  "cuda_build": getattr(getattr(torch,"version",None),"cuda",None),
-  "device_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
-  "cudnn_version": getattr(getattr(torch.backends,"cudnn",None),"version",lambda:None)(),
-  "cudnn_enabled": getattr(getattr(torch.backends,"cudnn",None),"is_available",lambda:False)(),
-}
-
-if info["cuda_available"] and info["device_count"]>0:
-    info["devices"] = [torch.cuda.get_device_name(i) for i in range(info["device_count"])]
-    # simple timing
-    a = torch.randn(4096,4096, device="cuda")
-    b = torch.randn(4096,4096, device="cuda")
-    torch.cuda.synchronize()
-    t0=time.time()
-    c = a@b
-    torch.cuda.synchronize()
-    info["matmul_ms"] = (time.time()-t0)*1000
-else:
-    info["devices"] = []
-
-lib_dir = os.path.join(os.path.dirname(torch.__file__), "lib")
-patterns = ["cudnn*64_9*.dll","cudnn*64_8*.dll","cudnn*.dll"]
-libs=[]
-for pat in patterns:
-    libs.extend(glob.glob(os.path.join(lib_dir, pat)))
-info["cudnn_libs_found"] = sorted(set(libs))
-print(json.dumps(info, indent=2))
-"""
-    import subprocess
-    subprocess.run([PythonExe, "-c", code], check=True)
-
-    code = """
-import torch, torch.nn as nn
-print("Device count:", torch.cuda.device_count(), "Current:", torch.cuda.current_device(), torch.cuda.get_device_name(0))
-x = torch.randn(1,3,128,128, device="cuda")
-conv = nn.Conv2d(3,16,3).cuda()
-y = conv(x)
-print("Conv ok, y shape:", y.shape)
-print("cuDNN enabled:", torch.backends.cudnn.is_available(), "version:", torch.backends.cudnn.version())
-"""
-    subprocess.run([PythonExe, "-c", code], check=True)
