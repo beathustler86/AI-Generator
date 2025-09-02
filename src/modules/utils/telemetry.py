@@ -8,14 +8,14 @@ from pathlib import Path
 from threading import RLock
 from datetime import datetime
 from typing import Any, Optional, Dict
+import atexit
 
 # Project root: telemetry.py is at <root>/src/modules/utils/telemetry.py
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 _LOG_DIR = _PROJECT_ROOT / "logs"
 _LOG_DIR.mkdir(parents=True, exist_ok=True)
-_LOG_FILE = _LOG_DIR / "telemetry.log"
-
-_lock = RLock()
+_LOG_FILE = None
+_FH = None
 
 def _serialize(obj: Any):
     try:
@@ -54,7 +54,15 @@ def log_event(data: Dict[str, Any], level: str = "info") -> None:
     rec.setdefault("ts", datetime.utcnow().isoformat())
     rec.setdefault("level", level)
     try:
-        _write_line(rec)
+        # Ensure telemetry initialized
+        if _LOG_FILE is None:
+            init_telemetry()
+        if _FH:
+            line = json.dumps(rec, ensure_ascii=False)
+            _FH.write(line + "\n")
+            _FH.flush()
+        else:
+            _write_line(rec)
     except Exception:
         pass
 
@@ -103,12 +111,39 @@ def install_threading_excepthook():
                 orig(args)
         threading.excepthook = _thook
 
-def init_telemetry(global_ex: bool = True, thread_ex: bool = True):
-    if global_ex:
-        install_global_exception_logger()
-    if thread_ex:
-        install_threading_excepthook()
-    log_event({"event": "telemetry_init", "file": str(_LOG_FILE)})
+def init_telemetry():
+    global _LOG_FILE, _FH
+    if _LOG_FILE:
+        return
+    from pathlib import Path
+    log_dir = Path("logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    _LOG_FILE = log_dir / "telemetry.log"
+    # Append instead of overwrite; line buffered
+    _FH = open(_LOG_FILE, "a", encoding="utf-8", buffering=1)
+    atexit.register(_flush_telemetry)
+    _emit({"event":"telemetry_init","file":str(_LOG_FILE)})
+
+def _flush_telemetry():
+    try:
+        if _FH:
+            _FH.flush()
+    except Exception:
+        pass
+
+def _emit(obj: dict):
+    try:
+        import json
+        obj = dict(obj)
+        from datetime import datetime
+        obj.setdefault("ts", datetime.utcnow().isoformat())
+        obj.setdefault("level", "info")
+        line = json.dumps(obj, ensure_ascii=False)
+        print(line, flush=True)
+        if _FH:
+            _FH.write(line + "\n")
+    except Exception:
+        pass
 
 __all__ = [
     "log_event",

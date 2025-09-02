@@ -1,95 +1,140 @@
-import sys
-import traceback
+from __future__ import annotations
+from typing import Optional, Any, List
+import os, sys, threading
 from pathlib import Path
+import traceback
 import json
-import os
+import importlib
+import platform
+import torch  # noqa
 
+# Project paths
 CURRENT = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT.parent
 for p in (str(PROJECT_ROOT), str(CURRENT)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-def _run_preflight_blocking():
+# Optional: quiet torchvision shim
+try:
+    from src.compat.tv_functional_tensor_shim import ensure_installed as _shim_ensure
+    _shim_ensure(verbose=os.getenv("SHIM_VERBOSE") in ("1","true","TRUE","on","On"))
+except Exception as e:
+    print(f"[Compat] Shim init failed: {e}", flush=True)
+
+def _run_preflight():
     try:
         from src.modules.preflight_check import run_preflight
-    except Exception as e:
-        print(f"[Preflight] Import error: {e}", flush=True)
-        return
-    try:
         result = run_preflight()
-        with open(PROJECT_ROOT / "preflight_last.json", "w", encoding="utf-8") as f:
-            json.dump(result, f, indent=2)
-        status = result.get("status")
-        miss_req = len(result.get("missing_required", []))
-        miss_opt = len(result.get("missing_optional", []))
-        auto_created = len(result.get("auto_created_optional", []))
-        print(
-            f"[Preflight] status={status} "
-            f"missing_required={miss_req} missing_optional={miss_opt} "
-            f"auto_created={auto_created}", flush=True
-        )
-        if miss_req:
-            print("[Preflight] Missing required files:", flush=True)
-            for m in result["missing_required"]:
-                print(f"  - {m}", flush=True)
+        (PROJECT_ROOT / "preflight_last.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+        print(f"[Preflight] status={result.get('status')} "
+              f"missing_required={len(result.get('missing_required', []))} "
+              f"missing_optional={len(result.get('missing_optional', []))} "
+              f"auto_created={len(result.get('auto_created_optional', []))}", flush=True)
     except Exception as e:
-        print(f"[Preflight] Runtime error: {e}", flush=True)
+        print(f"[Preflight] skipped: {e}", flush=True)
 
-_run_preflight_blocking()
+_run_preflight()
 
 try:
     from PySide6 import QtWidgets  # type: ignore
 except ImportError as e:
-    print("[FATAL] Qt binding import failed:", e)
-    raise
+    print("[FATAL] Qt import failed:", e)
+    raise SystemExit(1)
 
+# Import after sys.path prepared
 try:
     from src.gui.main_window import MainWindow
     from src.gui.ui_setup import Services
     from src.modules.model_manager import ModelManager
-except Exception as e:
-    print("Failed to import MainWindow or dependencies:", e)
+    import src.modules.generation as gen_mod
+except Exception:
     traceback.print_exc()
-    sys.exit(1)
+    raise SystemExit(1)
 
 DEFAULT_MODELS_ROOT = r"F:\SoftwareDevelopment\AI Models Image\AIGenerator\models"
 
+def _log_env_snapshot():
+    try:
+        from src.modules.utils.telemetry import log_event
+        vers = {}
+        for n in ("torch","diffusers","transformers","huggingface_hub","xformers"):
+            try:
+                m = importlib.import_module(n)
+                vers[n] = getattr(m, "__version__", "?")
+            except Exception:
+                vers[n] = "missing"
+        specs = {}
+        try:
+            specs["torch_cuda"] = torch.cuda.is_available()
+            if torch.cuda.is_available():
+                specs["cuda_version"] = torch.version.cuda
+                specs["gpu_name"] = torch.cuda.get_device_name(0)
+        except Exception:
+            pass
+        log_event({"event":"env_snapshot","versions":vers,"specs":specs})
+    except Exception:
+        pass
+
+def _auto_set_model(models_root):
+    try:
+        if not gen_mod.current_model_target():
+            from src.modules.generation import list_local_image_models, set_model_target
+            candidates = list_local_image_models()
+            if candidates:
+                set_model_target(candidates[0])
+                print(f"[AutoModel] Default model set: {candidates[0]}", flush=True)
+            else:
+                print("[AutoModel] No local models under:", models_root, flush=True)
+    except Exception as e:
+        print(f"[AutoModel] Failed: {e}", flush=True)
+
 def main():
     app = QtWidgets.QApplication(sys.argv)
-    # Use env override if present
-    models_root = Path(
-        os.environ.get("MODELS_ROOT", DEFAULT_MODELS_ROOT)
-    )
-    import json, pathlib
-    CFG_PATH = PROJECT_ROOT / "config" / "app.json"
-    if CFG_PATH.exists():
-        cfg = json.loads(CFG_PATH.read_text(encoding="utf-8"))
-        models_root = cfg.get("models_root", models_root)
+
+    if os.getenv("DISABLE_ENV_SNAPSHOT","0") != "1":
+        _log_env_snapshot()
+
+    models_root = Path(os.getenv("MODELS_ROOT", DEFAULT_MODELS_ROOT))
+    cfg_path = PROJECT_ROOT / "config" / "app.json"
+    if cfg_path.exists():
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            models_root = Path(cfg.get("models_root", models_root))
+        except Exception:
+            pass
+
     mm = ModelManager(models_root)
     services = Services(model_manager=mm)
     win = MainWindow(services=services)
     win.resize(1280, 800)
     win.show()
-    cache_dir = os.environ.get("PIPELINE_CACHE_DIR")
+
+    # Auto model
+    _auto_set_model(models_root)
+    env_target = os.getenv("DEFAULT_MODEL_TARGET")
+    if env_target:
+        try:
+            gen_mod.set_model_target(env_target)
+            print(f"[AutoModel] Set model target from env: {env_target}", flush=True)
+        except Exception as e:
+            print(f"[AutoModel] Env target failed: {e}", flush=True)
+
+    cache_dir = os.getenv("PIPELINE_CACHE_DIR")
     if cache_dir:
         try:
             win.statusBar().showMessage(f"Pipeline cache dir: {cache_dir}", 8000)
         except Exception:
             pass
-    sys.exit(app.exec())
+
+    code = app.exec()
+    try:
+        from src.modules.utils import telemetry as _t
+        if getattr(_t, "_FH", None):
+            _t._FH.flush()
+    except Exception:
+        pass
+    sys.exit(code)
 
 if __name__ == "__main__":
     main()
-
-def on_open_models_dir(self) -> None:
-    mm = getattr(self.services, "model_manager", None)
-    path = getattr(mm, "models_root", None)
-    if not path:
-        self._status("No models root configured.")
-        return
-    from pathlib import Path
-    if not Path(path).exists():
-        self._status(f"Models root missing: {path}")
-        return
-    # open logic unchanged...

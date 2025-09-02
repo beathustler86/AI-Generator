@@ -1,17 +1,117 @@
-# Good defaults
+# Python & build
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
+*.pyd
+*.so
+*.egg-info/
+build/
+dist/
+
+# Virtual environments / Python env managers
 .venv/
+venv/
 env/
-outputs/
-output/
-models/
-models_external/
-*.ckpt
-*.safetensors
-*.onnx
-*.engine
+ENV/
+.python-version
+
+# Environment & tooling artifacts
+pip-wheel-metadata/
+pip-log.txt
+sitecustomize*.cache
+
+# IDE / Editor
 .vscode/
 .vs/
+.idea/
+*.code-workspace
+
+# OS / Misc
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs / telemetry / runtime
+logs/
 *.log
+*.tmp
+tmp/
+temp/
+cache/
+.cache/
+pipeline_cache/
+hf_cache/
+.huggingface/
+wandb/
+mlruns/
+
+# Outputs / galleries / generated media
+outputs/
+output/
+outputs_tmp/
+gallery/
+gallery_cache/
+*.gif
+*.webp
+
+# Models & large assets (local copies / weights)
+models/
+models_external/
+models_backup/
+checkpoints/
+*.ckpt
+*.safetensors
+*.bin
+*.pth
+*.onnx
+*.engine
+*.pt2
+*.tensorrt
+
+# Upscaler & ESRGAN artifacts
+Upscaler/**/*.pth
+
+# Torch / compilation / performance caches
+torch_compile_cache/
+__torch__/ 
+*.torch_cache.json
+
+# Jupyter / notebooks
+.ipynb_checkpoints/
+*.ipynb~
+
+# Coverage / testing
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.tox/
+pytestdebug.log
+
+# Node / frontend (if added later)
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Temporary patch or diff helpers
+*.patch
+*.orig
+*.rej
+
+# Local configuration (env / secrets)
+*.env
+.env
+.env.*
+.envrc
+*.local
+
+# Lock snapshots you do NOT want auto-committed (uncomment if needed)
+# frozen_requirements.txt.backup
+# requirements-lock.json
+
+# Keep these explicitly allowed (negated patterns) if ever added
+#!requirements.txt
+#!requirements-core.txt
+#!requirements-dev.txt
+#!constraints-gpu.txt
+#!frozen_requirements.txt

@@ -2,6 +2,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from datetime import datetime
+import importlib, os
 
 from src.modules.utils.telemetry import log_event  # near top (guarded try/except if preferred)
 
@@ -64,6 +65,14 @@ def _check_gui_binding() -> dict:
             pass
     return result
 
+def _check_xformers():
+    want = os.getenv("ENABLE_XFORMERS","1") == "1"
+    spec = importlib.util.find_spec("xformers")
+    return {
+        "want_xformers": want,
+        "xformers_present": bool(spec)
+    }
+
 def run_preflight() -> dict:
     try:
         _safe_log("Preflight: verifying model checkpoints...")
@@ -101,9 +110,9 @@ def run_preflight() -> dict:
         if not any(gui.values()):
             missing_required.append("Qt binding (PySide6 or PyQt5) not installed")
 
-        status = "complete" if not missing_required else "failed"
+        xformers_info = _check_xformers()
         result = {
-            "status": status,
+            "status": "complete" if not missing_required else "failed",
             "missing_files": missing_required + missing_optional,
             "missing_required": missing_required,
             "missing_optional": missing_optional,
@@ -112,8 +121,12 @@ def run_preflight() -> dict:
             "auto_created_optional": auto_created,
             "qt_bindings": gui,
             "timestamp": datetime.utcnow().isoformat(),
+            "xformers": xformers_info,
         }
-        log_event({"event": "preflight", "status": status,
+        if xformers_info["want_xformers"] and not xformers_info["xformers_present"]:
+            result.setdefault("missing_optional", []).append("xformers")
+        
+        log_event({"event": "preflight", "status": result["status"],
            "missing_required": len(missing_required),
            "missing_optional": len(missing_optional)})
         return result
@@ -129,6 +142,7 @@ def run_preflight() -> dict:
             "auto_created_optional": [],
             "qt_bindings": {},
             "timestamp": datetime.utcnow().isoformat(),
+            "xformers": {},
         }
 
 __all__ = ["run_preflight"]

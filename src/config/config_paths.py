@@ -10,5 +10,3 @@ UPSCALE_MODEL_PATHS = dict(sorted({
 	"Remacri": UPSCALE_DIR / "4x_foolhardy_Remacri.pth",
 	"UltraSharp": UPSCALE_DIR / "4x-UltraSharp.pth"
 }.items()))
-
-

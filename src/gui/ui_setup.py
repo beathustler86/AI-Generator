@@ -6,7 +6,7 @@ try:
     from PySide6 import QtWidgets as QtW, QtGui, QtCore
 except ImportError:
     from PyQt5 import QtWidgets as QtW, QtGui, QtCore  # type: ignore
-import src.gui.main_window as mw
+import torch; torch.cuda.empty_cache()
 
 @dataclass
 class Services:
@@ -28,11 +28,11 @@ def _build_actions(win, services: Services) -> None:
     def mk(text, slot, shortcut=None, tip=None, icon=None):
         return _make_action(win, text=text, slot=slot, shortcut=shortcut, tip=tip, icon=icon)
 
-    # (label, attribute name, action key, shortcut, tooltip)
     spec = [
         ("&Open Models Dir", "on_open_models_dir", "act_open_models", "Ctrl+M", "Open base models folder"),
         ("&Generate Image", "on_generate", "act_generate", "Ctrl+G", "Generate image(s)"),
         ("Generate &Video", "on_generate_video", "act_generate_video", None, "Generate video"),
+        ("&Randomize Seed", "on_randomize_seed", "act_random_seed", "Ctrl+Shift+R", "Randomize seed value"),
         ("&Refine", "on_refine", "act_refine", "Ctrl+R", "Refine last image"),
         ("Se&ttings", "on_open_settings", "act_settings", "Ctrl+,", "Open application settings"),
         ("&Quit", "close", "act_quit", "Ctrl+Q", "Exit application"),
@@ -52,12 +52,12 @@ def _build_actions(win, services: Services) -> None:
         ("&Purge Cache", "on_cache_purge", "act_cache_purge", None, "Delete all cached pipelines"),
         ("Auto &Release VRAM", "on_toggle_auto_release", "act_toggle_auto_release", None, "Toggle idle auto VRAM release"),
         ("Open &Cache Dir", "on_open_cache_dir", "act_open_cache_dir", None, "Open pipeline disk cache folder"),
+        ("Show &Gallery", "on_toggle_gallery", "act_toggle_gallery", None, "Show/Hide gallery dock"),
     ]
     for label, attr, key, shortcut, tip in spec:
         if hasattr(win, attr):
             act = mk(label, getattr(win, attr), shortcut, tip)
             win._ui[key] = act
-            # Post-create adjustments
             if key == "act_upscale":
                 act.setEnabled(False)
 
@@ -96,6 +96,7 @@ def _build_menus(win, services: Services) -> None:
     view_menu = mb.addMenu("&View")
     if "act_toggle_dark" in win._ui: view_menu.addAction(win._ui["act_toggle_dark"])
     if "act_clear_log" in win._ui: view_menu.addAction(win._ui["act_clear_log"])
+    if "act_toggle_gallery" in win._ui: view_menu.addAction(win._ui["act_toggle_gallery"])
     help_menu = mb.addMenu("&Help")
 
     win._ui.update(menu_file=file_menu, menu_generation=gen_menu,
@@ -119,7 +120,11 @@ def _build_toolbars(win, services: Services) -> None:
     win._ui["model_combo"] = model_combo
     load_btn = QtW.QToolButton()
     load_btn.setText("Load Model")
-    load_btn.clicked.connect(win.on_load_model)  # type: ignore
+    if hasattr(win, "on_load_model"):
+        load_btn.clicked.connect(win.on_load_model)  # type: ignore
+    else:
+        load_btn.setEnabled(False)
+        load_btn.setToolTip("Model load handler unavailable")
     tb.addSeparator()
     tb.addWidget(model_combo)
     tb.addWidget(load_btn)
@@ -134,7 +139,6 @@ def _build_central(win, services: Services) -> None:
     form = QtW.QFormLayout()
     form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
 
-    # Common parameters
     win._ui["prompt_edit"] = QtW.QPlainTextEdit()
     win._ui["negative_edit"] = QtW.QPlainTextEdit()
     win._ui["steps_spin"] = _spin_box(30, 1, 200)
@@ -146,33 +150,24 @@ def _build_central(win, services: Services) -> None:
     win._ui["sampler_combo"] = QtW.QComboBox()
     win._ui["sampler_combo"].addItems(["euler_a", "ddim", "dpm++", "dpm-sde"])
 
-    # Video controls
     win._ui["video_frames_spin"] = _spin_box(16, 4, 1024, 4)
     win._ui["video_fps_spin"] = _spin_box(8, 1, 60, 1)
     win._ui["video_preset_combo"] = QtW.QComboBox()
     presets = [
-        "Custom",
-        "512x512",
-        "640x360",
-        "768x432",
-        "960x540",
-        "1024x576",
-        "1280x720",
-        "1920x1080",
+        "Custom","512x512","640x360","768x432","960x540",
+        "1024x576","1280x720","1920x1080",
     ]
     win._ui["video_preset_combo"].addItems(presets)
 
     video_row_container = QtW.QWidget()
     vlay = QtW.QHBoxLayout(video_row_container)
-    vlay.setContentsMargins(0,0,0,0)
-    vlay.setSpacing(6)
+    vlay.setContentsMargins(0,0,0,0); vlay.setSpacing(6)
     vlay.addWidget(_labeled_group("Frames", win._ui["video_frames_spin"]))
     vlay.addWidget(_labeled_group("FPS", win._ui["video_fps_spin"]))
     vlay.addWidget(_labeled_group("Preset", win._ui["video_preset_combo"]))
     vlay.addStretch(1)
     win._ui["video_row_container"] = video_row_container
 
-    # Form rows
     form.addRow("Prompt:", win._ui["prompt_edit"])
     form.addRow("Negative:", win._ui["negative_edit"])
     dims_row = _hbox([
@@ -187,6 +182,9 @@ def _build_central(win, services: Services) -> None:
         _labeled_group("Batch", win._ui["batch_spin"]),
         _labeled_group("Sampler", win._ui["sampler_combo"]),
     ])
+    seed_auto_chk = QtW.QCheckBox("Auto Rand")
+    win._ui["seed_auto_chk"] = seed_auto_chk
+    seed_row.addWidget(seed_auto_chk)
     form.addRow("Seeds:", seed_row)
     form.addRow("Video:", video_row_container)
 
@@ -199,30 +197,35 @@ def _build_central(win, services: Services) -> None:
     layout.addWidget(win._ui["preview_label"], 1)
 
     btn_row = _hbox([])
-    win._ui["btn_generate"] = QtW.QPushButton("Generate")
-    win._ui["btn_generate"].setStyleSheet("QPushButton { background:#2e7d32; color:white; }")
-    win._ui["btn_cancel"] = QtW.QPushButton("Cancel")
-    win._ui["btn_cancel"].setEnabled(False)
-    win._ui["btn_refine"] = QtW.QPushButton("Refine")
-    win._ui["btn_refine"].setEnabled(False)
-    btn_row.addWidget(win._ui["btn_generate"])
+    win._ui["btn_generate"] = QtW.QPushButton("Generate"); win._ui["btn_generate"].setVisible(False)
+    win._ui["btn_cancel"] = QtW.QPushButton("Cancel"); win._ui["btn_cancel"].setEnabled(False)
+    win._ui["btn_refine"] = QtW.QPushButton("Refine"); win._ui["btn_refine"].setEnabled(False)
     btn_row.addWidget(win._ui["btn_cancel"])
     btn_row.addWidget(win._ui["btn_refine"])
+
+    # Auto refine checkbox
+    auto_refine_chk = QtW.QCheckBox("Auto refine")
+    win._ui["auto_refine_chk"] = auto_refine_chk
+    btn_row.addWidget(auto_refine_chk)
+
     btn_row.addStretch(1)
     layout.addLayout(btn_row)
 
-    # Remember output directory checkbox
     remember_chk = QtW.QCheckBox("Remember save location")
     win._ui["remember_save_chk"] = remember_chk
     btn_row.addWidget(remember_chk)
     cache_chk = QtW.QCheckBox("Use pipeline cache")
     win._ui["pipeline_cache_chk"] = cache_chk
     btn_row.addWidget(cache_chk)
+    auto_gallery_chk = QtW.QCheckBox("Auto save to gallery")
+    win._ui["auto_gallery_chk"] = auto_gallery_chk
+    btn_row.addWidget(auto_gallery_chk)
 
     win.setCentralWidget(central)
-    win._ui["btn_generate"].clicked.connect(win.on_generate)       # type: ignore
-    win._ui["btn_cancel"].clicked.connect(win.on_cancel_generate)  # type: ignore
-    win._ui["btn_refine"].clicked.connect(win.on_refine)           # type: ignore
+    if hasattr(win,"on_generate"):
+        win._ui["btn_generate"].clicked.connect(win.on_generate)       # type: ignore
+    win._ui["btn_cancel"].clicked.connect(win.on_cancel_generate)      # type: ignore
+    win._ui["btn_refine"].clicked.connect(win.on_refine)               # type: ignore
     win._ui["video_preset_combo"].currentTextChanged.connect(win.on_video_preset_changed)  # type: ignore
     win._ui["width_spin"].valueChanged.connect(win.on_video_dims_manual_changed)  # type: ignore
     win._ui["height_spin"].valueChanged.connect(win.on_video_dims_manual_changed) # type: ignore
@@ -230,12 +233,15 @@ def _build_central(win, services: Services) -> None:
         win._ui["remember_save_chk"].toggled.connect(win.on_toggle_remember_output)  # type: ignore
     if hasattr(win, "on_toggle_pipeline_cache"):
         win._ui["pipeline_cache_chk"].toggled.connect(win.on_toggle_pipeline_cache)  # type: ignore
+    if hasattr(win, "on_toggle_auto_gallery"):
+        win._ui["auto_gallery_chk"].toggled.connect(win.on_toggle_auto_gallery)  # type: ignore
+    if hasattr(win, "on_toggle_auto_refine"):
+        win._ui["auto_refine_chk"].toggled.connect(win.on_toggle_auto_refine)  # type: ignore
 
 def _build_docks(win, services: Services) -> None:
     dock_log = QtW.QDockWidget("Log", win)
     dock_log.setObjectName("LogDock")
-    txt = QtW.QPlainTextEdit()
-    txt.setReadOnly(True)
+    txt = QtW.QPlainTextEdit(); txt.setReadOnly(True)
     dock_log.setWidget(txt)
     win.addDockWidget(QtCore.Qt.DockWidgetArea.BottomDockWidgetArea, dock_log)
     win._ui["dock_log"] = dock_log
@@ -250,8 +256,7 @@ def _build_statusbar(win, services: Services) -> None:
     sb.addWidget(win._ui["status_msg"], 1)
 
 def _apply_styles(win, qss_path: Optional[str]) -> None:
-    if not qss_path:
-        return
+    if not qss_path: return
     try:
         from pathlib import Path
         p = Path(qss_path)
@@ -264,10 +269,8 @@ def _make_action(win, text: str, slot: Callable, shortcut: Optional[str],
                  tip: Optional[str], icon: Optional[str] = None):
     QActionClass = getattr(QtGui, "QAction", None) or getattr(QtW, "QAction")
     act = QActionClass(text, win)
-    if icon:
-        act.setIcon(QtGui.QIcon(icon))
-    if shortcut:
-        act.setShortcut(QtGui.QKeySequence(shortcut))
+    if icon: act.setIcon(QtGui.QIcon(icon))
+    if shortcut: act.setShortcut(QtGui.QKeySequence(shortcut))
     if tip:
         act.setStatusTip(tip)
         act.setToolTip(f"{text} ({shortcut})" if shortcut else text)
@@ -276,33 +279,22 @@ def _make_action(win, text: str, slot: Callable, shortcut: Optional[str],
     return act
 
 def _spin_box(value: int, minimum: int, maximum: int, step: int = 1) -> QtW.QSpinBox:
-    sb = QtW.QSpinBox()
-    sb.setRange(minimum, maximum)
-    sb.setValue(value)
-    sb.setSingleStep(step)
-    return sb
+    sb = QtW.QSpinBox(); sb.setRange(minimum, maximum); sb.setValue(value); sb.setSingleStep(step); return sb
 
 def _double_spin_box(value: float, minimum: float, maximum: float, step: float) -> QtW.QDoubleSpinBox:
     dsb = QtW.QDoubleSpinBox()
-    dsb.setDecimals(2)
-    dsb.setRange(minimum, maximum)
-    dsb.setValue(value)
-    dsb.setSingleStep(step)
+    dsb.setDecimals(2); dsb.setRange(minimum, maximum); dsb.setValue(value); dsb.setSingleStep(step)
     return dsb
 
 def _hbox(widgets) -> QtW.QHBoxLayout:
     layout = QtW.QHBoxLayout()
-    layout.setContentsMargins(0,0,0,0)
-    layout.setSpacing(6)
-    for w in widgets:
-        layout.addWidget(w)
+    layout.setContentsMargins(0,0,0,0); layout.setSpacing(6)
+    for w in widgets: layout.addWidget(w)
     return layout
 
 def _labeled_group(label: str, widget: QtW.QWidget) -> QtW.QWidget:
     box = QtW.QWidget()
-    v = QtW.QVBoxLayout(box)
-    v.setContentsMargins(0, 0, 0, 0)
-    lab = QtW.QLabel(label)
-    lab.setAlignment(QtCore.Qt.AlignmentFlag.AlignHCenter)
+    v = QtW.QVBoxLayout(box); v.setContentsMargins(0, 0, 0, 0)
+    lab = QtW.QLabel(label); lab.setAlignment(QtCore.Qt.AlignmentFlag.AlignHCenter)
     v.addWidget(lab); v.addWidget(widget)
     return box
