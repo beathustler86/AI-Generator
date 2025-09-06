@@ -1,790 +1,1619 @@
 from __future__ import annotations
-import os, time, math
-import json
-import threading
+import os, time, hashlib, gc, shutil, threading
 from pathlib import Path
-from typing import List, Tuple, Optional, Callable, Dict
-import shutil
+from typing import Optional, Any, List, Dict, Tuple, Callable
 import torch
-import hashlib
-import multiprocessing as mp
+from contextlib import suppress
+
+# Base perf knobs
+if torch.cuda.is_available():
+    with suppress(Exception):
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+
+try:
+    import xformers  # type: ignore
+    _XFORMERS_AVAILABLE = True
+except Exception:
+    _XFORMERS_AVAILABLE = False
 
 from diffusers import (
+    StableDiffusionPipeline,
+    StableDiffusionXLPipeline,
     EulerAncestralDiscreteScheduler,
     DDIMScheduler,
     DPMSolverMultistepScheduler,
     DPMSolverSDEScheduler,
+    DPMSolverMultistepScheduler as DPMSMS
 )
 
-# ---------------- Configuration / Environment ----------------
-ENV_KEY = "MODEL_ID_OR_PATH"
-
-DEFAULT_CACHE_ROOT = Path(os.environ.get(
-    "PIPELINE_CACHE_DIR",
-    str(Path(__file__).resolve().parents[2] / "pipeline_cache")
-)).resolve()
-
-MODELS_ROOT      = Path(r"F:\SoftwareDevelopment\AI Models Image\AIGenerator\models")
-TEXT_TO_IMAGE_DIR = MODELS_ROOT / "text_to_image"
-TEXT_TO_VIDEO_DIR = MODELS_ROOT / "text_to_video"
-
-PREFERRED_LOCAL_NAMES = [
-    "dreamshaper-xl-v2-turbo",
-    "sdxl-base-1.0",
-    "sdxl-base-1.5",
-]
-
-HF_FALLBACK = "stabilityai/stable-diffusion-xl-base-1.0"
-
-_DISK_CACHE_ENABLED  = os.environ.get("DISK_PIPELINE_CACHE", "1") == "1"  # runtime mutable
-DISK_CACHE_REBUILD  = os.environ.get("REBUILD_PIPELINE_CACHE", "0") == "1"
-PIPELINE_DISK_CACHE_DIR = DEFAULT_CACHE_ROOT
-PIPELINE_DISK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-PIPELINE_CACHE_MAX_ITEMS = int(os.environ.get("PIPELINE_CACHE_MAX_ITEMS", "6"))
-PIPELINE_CACHE_MAX_GB    = float(os.environ.get("PIPELINE_CACHE_MAX_GB", "18.0"))
-
-TORCH_COMPILE_ENABLED    = os.environ.get("TORCH_COMPILE", "0") == "1"
-TORCH_COMPILE_MODE       = os.environ.get("TORCH_COMPILE_MODE", "reduce-overhead")
-TORCH_COMPILE_BACKEND    = os.environ.get("TORCH_COMPILE_BACKEND", "inductor")
-
-PREFETCH_MODELS          = os.environ.get("PREFETCH_MODELS", "0") == "1"
-
-# ---------------- In-memory pipeline cache ----------------
-_PIPELINE = None
-_PIPELINE_MODEL_ID: Optional[str] = None
-_DEVICE = None
-_PIPELINE_CACHE: Dict[tuple, object] = {}
-_PIPELINE_CACHE_ORDER: List[tuple] = []
-_PIPELINE_CACHE_MAX = 3  # in-RAM pipeline objects
-
-LAST_SCHEDULER_NAME: Optional[str] = None
-
-# Shared text encoder pool { sha256(file list hash) : module }
-_SHARED_TEXT_ENCODERS: Dict[str, torch.nn.Module] = {}
-
-_SCHEDULER_MAP = {
-    "euler_a": EulerAncestralDiscreteScheduler,
-    "ddim": DDIMScheduler,
-    "dpm++": DPMSolverMultistepScheduler,
-    "dpm-sde": DPMSolverSDEScheduler,
-}
-
-_LOCK = threading.RLock()
-
-# ---------------- Utility helpers ----------------
-def _log_event(rec: Dict):
+def _log_event(rec: Dict[str, Any]):
     try:
         from src.modules.utils.telemetry import log_event
         log_event(rec)
     except Exception:
         pass
 
-def _is_diffusers_dir(p: Path) -> bool:
-    return p.is_dir() and (p / "model_index.json").exists()
-
-def _has_text_encoder_2(p: Path) -> bool:
-    return (p / "text_encoder_2").exists() or (p / "tokenizer_2").exists()
-
-def _similar_dirs(parent: Path, target_name: str) -> list[Path]:
-    if not parent.exists(): return []
-    tn = target_name.lower()
-    out = []
-    for d in parent.iterdir():
-        if not d.is_dir(): continue
-        name = d.name.lower()
-        if name == tn or name.startswith(tn) or tn.startswith(name) or tn.replace("-", "") in name.replace("-", ""):
-            out.append(d)
-    return out
-
-def _friendly_snapshot_label(p: Path) -> str:
-    for comp in p.parents:
-        if comp.name.startswith("models--"):
-            segs = comp.name.split("--")
-            if len(segs) >= 3:
-                return segs[-1]
-    return p.parent.name if len(p.name) >= 32 else p.name
-
-def _friendly_label(path: str) -> str:
-    p = Path(path)
-    if "snapshots" in p.parts:
-        return _friendly_snapshot_label(p)
-    name = p.name
-    if name.startswith("models--"):
-        return name.split("--")[-1]
-    return name
-
-def list_local_image_models() -> list[str]:
-    paths: list[str] = []
-    if TEXT_TO_IMAGE_DIR.is_dir():
-        for d in TEXT_TO_IMAGE_DIR.iterdir():
-            if _is_diffusers_dir(d):
-                paths.append(str(d.resolve()))
-    for d in MODELS_ROOT.glob("models--*"):
-        snap_root = d / "snapshots"
-        if snap_root.is_dir():
-            for s in snap_root.iterdir():
-                if _is_diffusers_dir(s):
-                    paths.append(str(s.resolve()))
-    return sorted(paths)
-
-def _video_model_entries() -> list[Tuple[str,str]]:
-    entries: list[Tuple[str,str]] = []
-    comfy = TEXT_TO_VIDEO_DIR / "ComfyUI"
-    if comfy.exists():
-        entries.append(("ComfyUI (video)", str(comfy.resolve())))
-    for d in TEXT_TO_VIDEO_DIR.iterdir() if TEXT_TO_VIDEO_DIR.exists() else []:
-        if d.is_dir() and d.name.lower().startswith("cosmos") and d != comfy:
-            entries.append((f"{d.name} (video)", str(d.resolve())))
-    return entries
-
-def list_all_models() -> list[Dict]:
-    out: list[Dict] = []
-    for p in list_local_image_models():
-        out.append({"label": _friendly_label(p), "path": p, "kind": "image"})
-    existing = {e["label"] for e in out}
-    for label, path in _video_model_entries():
-        if label in existing: label += " (video)"
-        out.append({"label": label, "path": path, "kind": "video"})
-    seen: Dict[str,int] = {}
-    for e in out:
-        lbl = e["label"]
-        if lbl in seen:
-            seen[lbl] += 1
-            e["label"] = f"{lbl}#{seen[lbl]}"
-        else:
-            seen[lbl] = 1
-    return out
-
-# Upscalers
-def list_upscalers(root: Path = MODELS_ROOT) -> list[dict]:
-    up_dir = root / "Upscaler"
-    entries = []
-    if up_dir.exists():
-        for p in up_dir.rglob("*.pth"):
-            if p.name.lower().startswith((".", "test")):
-                continue
-            entries.append({"name": p.stem, "path": str(p.resolve())})
-    return sorted(entries, key=lambda x: x["name"])
-
-def current_model_target() -> str:
-    return os.environ.get(ENV_KEY, "")
-
-def set_model_target(target: str):
-    global _PIPELINE, _PIPELINE_MODEL_ID
-    with _LOCK:
-        _PIPELINE = None
-        _PIPELINE_MODEL_ID = None
-    os.environ[ENV_KEY] = target
-
-def is_video_path(path_or_id: str) -> bool:
-    p = path_or_id.lower()
-    return "comfyui" in p or "text_to_video" in p or p.endswith("(video)")
-
-def _classify_target() -> Tuple[str, bool]:
-    env_val = os.environ.get(ENV_KEY, "").strip()
-    if env_val:
-        p = Path(env_val)
-        if p.is_dir():
-            if _is_diffusers_dir(p):
-                return str(p), True
-            cands = _similar_dirs(p.parent, p.name)
-            if p.parent != TEXT_TO_IMAGE_DIR:
-                cands += _similar_dirs(TEXT_TO_IMAGE_DIR, p.name)
-            for c in cands:
-                if _is_diffusers_dir(c):
-                    print(f"[Generation] Auto-corrected model path '{p}' -> '{c}'", flush=True)
-                    return str(c), True
-            raise RuntimeError(f"Path '{p}' not a diffusers model (no model_index.json). Candidates: {[c.name for c in cands]}")
-        else:
-            base = Path(env_val).name
-            cands = _similar_dirs(TEXT_TO_IMAGE_DIR, base)
-            if cands:
-                best = max(cands, key=lambda x: len(x.name))
-                print(f"[Generation] Auto-corrected missing path '{env_val}' -> '{best}'", flush=True)
-                return str(best), True
-            return env_val.replace("\\", "/"), False
-    locals_all = list_local_image_models()
-    by_name = {Path(p).name: p for p in locals_all}
-    for name in PREFERRED_LOCAL_NAMES:
-        if name in by_name:
-            return by_name[name], True
-    if locals_all:
-        return locals_all[0], True
-    return HF_FALLBACK, False
-
-def _select_pipeline_class(model_dir: Path):
-    from diffusers import StableDiffusionPipeline, StableDiffusionXLPipeline
-    if _has_text_encoder_2(model_dir):
-        return StableDiffusionXLPipeline
-    return StableDiffusionPipeline
-
-def _apply_scheduler(pipe, sampler: str):
-    global LAST_SCHEDULER_NAME
-    if not sampler: return pipe
-    sampler = sampler.lower()
-    if sampler == LAST_SCHEDULER_NAME:
-        return pipe
-    if sampler not in _SCHEDULER_MAP:
-        return pipe
-    cls = _SCHEDULER_MAP[sampler]
+def _log_exception(e: Exception, context: str):
     try:
-        new_sched = cls.from_config(pipe.scheduler.config)
-        pipe.scheduler = new_sched
-        LAST_SCHEDULER_NAME = sampler
-    except Exception as e:
-        print(f"[Generation] Scheduler swap failed ({sampler}): {e}", flush=True)
-    return pipe
-
-# ---------------- Disk cache (persisted) ----------------
-def _hash_key(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:10]
-
-def _canonical_path(p: str) -> str:
-    try:
-        cp = str(Path(p).resolve())
-    except Exception:
-        cp = p
-    # Normalize case on Windows so mapping matches
-    if os.name == "nt":
-        cp = os.path.normcase(cp)
-    return cp.replace("\\", "/")
-
-def _cache_slug_for(path: str) -> str:
-    path = _canonical_path(path)
-    p = Path(path)
-    base = p.name if p.exists() else Path(path).name
-    if len(base) > 48:
-        base = base[:48]
-    return f"{base}-{_hash_key(path)}"
-
-def _resolve_cached_path(original: str) -> Optional[str]:
-    if not _DISK_CACHE_ENABLED or DISK_CACHE_REBUILD:
-        return None
-    orig_canon = _canonical_path(original)
-    slug = _cache_slug_for(orig_canon)
-    cdir = PIPELINE_DISK_CACHE_DIR / slug
-    if (cdir / "model_index.json").exists():
-        _log_event({"event":"disk_cache_hit","slug":slug})
-        return str(cdir.resolve())
-    # Mapping file shortcut
-    map_file = PIPELINE_DISK_CACHE_DIR / "mapping.json"
-    try:
-        if map_file.exists():
-            mapping = json.loads(map_file.read_text(encoding="utf-8"))
-            slug = mapping.get(orig_canon) or mapping.get(original)
-            if slug:
-                cdir = PIPELINE_DISK_CACHE_DIR / slug
-                if (cdir / "model_index.json").exists():
-                    _log_event({"event":"disk_cache_hit","slug":slug,"mapped":True})
-                    return str(cdir.resolve())
+        from src.modules.utils.telemetry import log_exception
+        log_exception(e, context=context)
     except Exception:
         pass
-    _log_event({"event":"disk_cache_miss","original":original})
+
+MODELS_ROOT = Path(os.environ.get(
+    "MODELS_ROOT", r"F:\SoftwareDevelopment\AI Models Image\AIGenerator\models"
+)).resolve()
+TEXT_TO_IMAGE_DIR = MODELS_ROOT / "text_to_image"
+TEXT_TO_VIDEO_DIR = MODELS_ROOT / "text_to_video"
+
+PIPELINE_DISK_CACHE_DIR = Path(os.environ.get(
+    "PIPELINE_CACHE_DIR",
+    str(Path(__file__).resolve().parents[2] / "pipeline_cache")
+)).resolve()
+PIPELINE_DISK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# After PIPELINE_DISK_CACHE_DIR mkdir and before try: _DISK_CACHE_ENABLED
+if os.getenv("PIPELINE_CACHE_DISABLE","0") == "1":
+    try:
+        _DISK_CACHE_ENABLED = False  # type: ignore
+    except Exception:
+        pass
+try: _DISK_CACHE_ENABLED
+except NameError: _DISK_CACHE_ENABLED = True
+try: _CURRENT_TARGET
+except NameError: _CURRENT_TARGET = None
+
+_DISK_CACHE_MAX_ITEMS = int(os.environ.get("PIPELINE_CACHE_MAX_ITEMS","5"))
+_DISK_CACHE_MAX_GB = float(os.environ.get("PIPELINE_CACHE_MAX_GB","50.0"))
+
+_CURRENT_TARGET: Optional[str] = None
+_PIPELINE = None
+_PIPELINE_DEVICE: Optional[str] = None
+_LOCK = threading.RLock()
+LAST_SCHEDULER_NAME: Optional[str] = None
+_LAST_VRAM_SNAPSHOT: Optional[Tuple[int,int,str]] = None
+
+_SCHEDULER_MAP = {
+    "euler_a": EulerAncestralDiscreteScheduler,
+    "ddim": DDIMScheduler,
+    "dpm++": DPMSolverMultistepScheduler,
+    "dpm-sde": DPMSolverSDEScheduler,
+    "dpmpp_2m_karras": DPMSolverMultistepScheduler,
+    "dpmpp-2m-karras": DPMSolverMultistepScheduler,
+}
+
+_PREV_STEP_AVG: Dict[str, float] = {}
+_PERF_REG_THRESH = 1.35
+_SDPA_FALLBACK_LOGGED = False
+FREE_VRAM_AFTER_GEN = os.getenv("FREE_VRAM_AFTER_GEN","0") == "1"
+_LAST_SDXL_DECODE_MS = 0
+_SLOW_VAE_DETECTED = False
+_VAE_FP32_FORCED = False
+_SDXL_FORCE_TWO_PHASE = False
+
+# ---------- SDXL flat / collapsed latent helpers ----------
+def _sdxl_inflate_latent(lat: torch.Tensor) -> List[torch.Tensor]:
+    try:
+        if lat.dim() == 3:
+            lat = lat.unsqueeze(0)
+        amp = float(os.getenv("SDXL_LATENT_RESCUE_AMP", "0.8"))
+        scale_boost = float(os.getenv("SDXL_LATENT_SCALE_BOOST", "3.0"))
+        return [
+            lat + torch.randn_like(lat) * amp,
+            lat + torch.randn_like(lat) * (amp * 0.5),
+            lat * scale_boost,
+            lat * scale_boost + torch.randn_like(lat) * (amp * 0.25),
+        ]
+    except Exception:
+        return []
+
+def _image_is_flat(pil_img, std_eps: float = 1e-3) -> bool:
+    try:
+        import numpy as np
+        arr = np.asarray(pil_img).astype("float32") / 255.0
+        return float(arr.std()) <= std_eps
+    except Exception:
+        return False
+
+def _latent_std(t: torch.Tensor) -> float:
+    try:
+        return float(t.detach().float().std().item())
+    except Exception:
+        return -1.0
+
+def _log_sdpa_fallback():
+    global _SDPA_FALLBACK_LOGGED
+    if _SDPA_FALLBACK_LOGGED: return
+    _log_event({"event":"sdpa_fallback_used"}); _SDPA_FALLBACK_LOGGED=True
+
+# >>> PATCH START: re-add memory optimization helper <<<
+def _maybe_enable_memory_opts(pipe):
+    t = time.time()
+    enabled = []
+    with suppress(Exception):
+        if os.getenv("ENABLE_XFORMERS","1") == "1":
+            if _XFORMERS_AVAILABLE and hasattr(pipe, "enable_xformers_memory_efficient_attention"):
+                pipe.enable_xformers_memory_efficient_attention()
+                enabled.append("xformers")
+            else:
+                _log_sdpa_fallback()
+        if os.getenv("ENABLE_ATTN_SLICING","0") == "1" and hasattr(pipe, "enable_attention_slicing"):
+            pipe.enable_attention_slicing()
+            enabled.append("attn_slicing")
+        if os.getenv("ENABLE_SEQUENTIAL_CPU_OFFLOAD","0") == "1" and hasattr(pipe, "enable_sequential_cpu_offload"):
+            pipe.enable_sequential_cpu_offload()
+            enabled.append("seq_offload")
+    _log_event({
+        "event":"model_load_phase",
+        "phase":"memory_opts",
+        "ms": int((time.time()-t)*1000),
+        "enabled": enabled
+    })
+# >>> PATCH END <<<
+
+def _enable_sdxl_vae_opts(pipe):
+    try:
+        vae = getattr(pipe, "vae", None)
+        if not vae:
+            return
+        if os.getenv("SDXL_VAE_SLICING", "1") == "1" and hasattr(vae, "enable_slicing"):
+            vae.enable_slicing()
+            _log_event({"event": "sdxl_vae_slicing"})
+        if os.getenv("SDXL_VAE_TILING", "0") == "1" and hasattr(vae, "enable_tiling"):
+            vae.enable_tiling()
+            _log_event({"event": "sdxl_vae_tiling"})
+    except Exception as e:
+        _log_exception(e, "sdxl_vae_opts")
+
+def _sdxl_manual_decode_batch(pipe, latents: torch.Tensor, force_fp32: bool = False):
+    from PIL import Image
+    vae = getattr(pipe, "vae", None)
+    if vae is None:
+        raise RuntimeError("VAE missing for decode")
+    want_stats = os.getenv("SDXL_DECODE_STATS", "0") == "1"
+
+    # Fast path for Dreamshaper Turbo: single canonical divide + decode
+    profile = _profile_for_target(current_model_target() or "")
+    if profile == "turbo" and os.getenv("TURBO_SIMPLE_DECODE", "1") == "1":
+        scale = float(getattr(vae.config, "scaling_factor", 0.18215))
+        with torch.inference_mode():
+            z = (latents.to(device=vae.device, dtype=vae.dtype)) / scale
+            dec = _chunked_vae_decode_if_needed(vae, z)  # disables cudnn.benchmark during decode
+            img = (dec/2+0.5).clamp(0,1)[0].detach().cpu()
+            import numpy as np
+            arr = (img.mul(255).round().byte().permute(1,2,0).numpy())
+            return [Image.fromarray(arr)]
+
+    base_scale = float(getattr(vae.config, "scaling_factor", 0.18215))
+    alt_scales = [base_scale, base_scale * 1.5, base_scale * 2.0, base_scale * 0.5]
+    imgs = []
+
+    def stat(tag,t):
+        if not want_stats: return
+        with torch.no_grad():
+            _log_event({"event":"sdxl_latent_stat", "tag":tag,
+                        "mean":float(t.mean().item()),
+                        "std":float(t.std().item()),
+                        "min":float(t.min().item()),
+                        "max":float(t.max().item())})
+    stat("raw", latents)
+
+    def build(scale:float, mode:str, cast_fp32:bool=False):
+        t = latents.to(dtype=vae.dtype)
+        if mode=="divide":
+            t = t/scale
+        elif mode=="none":
+            pass
+        elif mode=="multiply":
+            t = t*scale
+        return torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
+
+    attempts = []
+    attempts.append(("divide_base_fp16" if not force_fp32 else "divide_base_fp32",
+                     lambda: build(base_scale,"divide",False)))
+    for sc in alt_scales[1:]:
+        attempts.append((f"divide_alt{sc:g}", lambda sc=sc: build(sc,"divide",False)))
+    attempts.append(("no_divide", lambda: build(base_scale,"none",False)))
+    attempts.append(("divide_base_force_fp32", lambda: build(base_scale,"divide",True)))
+    attempts.append(("multiply_base", lambda: build(base_scale,"multiply",False)))
+    for sc in alt_scales[1:]:
+        attempts.append((f"multiply_alt{sc:g}", lambda sc=sc: build(sc,"multiply",False)))
+
+    def decode_variant(name,tensor):
+        try:
+            with torch.inference_mode():
+                tensor = tensor.to(device=vae.device, dtype=vae.dtype)
+                # Always go through helper to keep cudnn.benchmark disabled during decode
+                out = _chunked_vae_decode_if_needed(vae, tensor)
+                if out is not None and torch.is_tensor(out) and float(out.float().std().item()) < 1e-6:
+                    _log_event({"event": "sdxl_decode_zero_output", "variant": name})
+                return out
+        except Exception as e:
+            _log_exception(e,f"sdxl_decode_{name}")
+            return None
+
+    def to_img(dec):
+        im=(dec/2+0.5).clamp(0,1)[0].detach().cpu()
+        return im
+
+    flat_variants = 0
+    chosen_variant = None
+    for name,maker in attempts:
+        lat_try=maker()
+        stat(f"latent_{name}", lat_try)
+        dec=decode_variant(name, lat_try)
+        if dec is None:
+            continue
+        dec=torch.nan_to_num(dec, nan=0.0, posinf=0.0)
+        img_t=to_img(dec)
+        b=float(img_t.mean().item())
+        s=float(img_t.std().item())
+        _log_event({"event":"sdxl_decode_try","variant":name,"brightness":b,"std":s})
+        flat = (s < 0.0008) or (b!=b)
+        if flat:
+            flat_variants += 1
+        if not flat and chosen_variant is None:
+            chosen_variant = img_t
+            break
+
+    if chosen_variant is None:
+        if flat_variants == len(attempts):
+            _log_event({"event":"sdxl_decode_all_flat","attempts":len(attempts)})
+        try:
+            rec_lat = (latents.float() if force_fp32 else latents.to(vae.dtype)) * (base_scale * 2.0)
+            dec = _chunked_vae_decode_if_needed(vae, rec_lat)
+            dec=torch.nan_to_num(dec, nan=0.0, posinf=0.0)
+            rec_img=to_img(dec)
+            rb=float(rec_img.mean().item()); rs=float(rec_img.std().item())
+            _log_event({"event":"sdxl_decode_recover_attempt","brightness":rb,"std":rs})
+            if rs >= 0.0008:
+                chosen_variant = rec_img
+        except Exception as e:
+            _log_exception(e,"sdxl_decode_recover_attempt")
+
+    if chosen_variant is None:
+        try:
+            lat_final=build(base_scale,"divide",True)
+            dec=_chunked_vae_decode_if_needed(vae, lat_final)
+            dec=torch.nan_to_num(dec, nan=0.0, posinf=0.0)
+            chosen_variant=to_img(dec)
+            b=float(chosen_variant.mean().item()); s=float(chosen_variant.std().item())
+            _log_event({"event":"sdxl_decode_final_fallback","brightness":b,"std":s})
+        except Exception:
+            from PIL import Image
+            imgs.append(Image.new("RGB",(latents.shape[-1]*8, latents.shape[-2]*8),(0,0,0)))
+            _log_event({"event":"sdxl_decode_total_fail"})
+            return imgs
+
+    if chosen_variant is not None:
+        import numpy as np
+        arr=(chosen_variant.mul(255).round().byte().permute(1,2,0).numpy())
+        imgs.append(Image.fromarray(arr))
+
+    if not imgs:
+        from PIL import Image
+        imgs.append(Image.new("RGB",(latents.shape[-1]*8, latents.shape[-2]*8),(0,0,0)))
+        _log_event({"event":"sdxl_decode_total_fail_post_recover"})
+    return imgs
+
+# --- Fast path helper (diagnostic) ---
+def _sdxl_fast_decode_latent(pipe, latents: torch.Tensor):
+    """
+    Minimal decode (single attempt) for two-phase diagnostics.
+      FAST_TWOPHASE_DECODE=1 to enable.
+    """
+    if latents.dim()==3:
+        latents = latents.unsqueeze(0)
+    latents = latents.detach().contiguous().clone()
+    vae = getattr(pipe,"vae",None)
+    if vae is None:
+        raise RuntimeError("VAE missing for decode")
+    scale = float(getattr(vae.config,"scaling_factor",0.18215))
+    with torch.inference_mode():
+        z = latents.to(device=vae.device, dtype=vae.dtype)
+        # single canonical divide
+        z = z / scale
+        out = vae.decode(z).sample
+        out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+        img = (out/2+0.5).clamp(0,1)[0].detach().cpu()
+        std_val = float(img.std().item())
+        mean_val = float(img.mean().item())
+        _log_event({"event":"sdxl_fast_decode_stat","mean":mean_val,"std":std_val})
+        from PIL import Image
+        import numpy as np
+        arr=(img.mul(255).round().byte().permute(1,2,0).numpy())
+        return Image.fromarray(arr), std_val
+
+
+# --- Pipeline-native decode helper (preferred) ---
+def _chunked_vae_decode_if_needed(vae, z: torch.Tensor):
+    """
+    Optionally split latent along height to reduce a very slow monolithic decode.
+      VAE_DECODE_CHUNKS = N (>=1). If 1 => direct decode.
+    Disables cudnn.benchmark during decode to avoid long per-call algo re-search.
+    Emits vae_decode_chunked event.
+    """
+    chunks = int(os.getenv("VAE_DECODE_CHUNKS", "1"))
+    prev_flag = torch.backends.cudnn.benchmark
+    torch.backends.cudnn.benchmark = False
+    try:
+        if chunks <= 1:
+            with torch.inference_mode():
+                out = vae.decode(z).sample
+            try:
+                _log_event({"event": "vae_decode_direct_std",
+                            "std": float(out.float().std().item())})
+            except Exception:
+                pass
+            return out
+        B,C,H,W = z.shape
+        base = H // chunks
+        rem = H % chunks
+        h_cursor = 0
+        parts = []
+        for i in range(chunks):
+            h = base + (1 if i < rem else 0)
+            h_end = h_cursor + h
+            slice_z = z[:, :, h_cursor:h_end, :]
+            with torch.inference_mode():
+                dec_part = vae.decode(slice_z).sample
+            parts.append(dec_part)
+            h_cursor = h_end
+        out = torch.cat(parts, dim=2)
+        try:
+            _log_event({"event": "vae_decode_chunked",
+                        "chunks": chunks,
+                        "shape": [int(x) for x in out.shape],
+                        "std": float(out.float().std().item())})
+        except Exception:
+            pass
+        return out
+    except Exception as e:
+        _log_exception(e, "vae_decode_chunked_fail")
+        with torch.inference_mode():
+            out = vae.decode(z).sample
+        return out
+    finally:
+        torch.backends.cudnn.benchmark = prev_flag
+
+def _sdxl_pipeline_decode(pipe, latents: torch.Tensor):
+    """
+    Use pipeline.decode_latents if available (mirrors internal diffusers logic).
+    Falls back to direct vae.decode if method missing.
+    """
+    if latents.dim() == 3:
+        latents = latents.unsqueeze(0)
+    latents = latents.detach().contiguous().clone()
+    vae = getattr(pipe, "vae", None)
+    if vae is None:
+        raise RuntimeError("VAE missing")
+    scale = float(getattr(vae.config, "scaling_factor", 0.18215))
+    t0 = time.time()
+    img_pil = None
+    std_val = -1.0
+    try:
+        if hasattr(pipe, "decode_latents") and os.getenv("TWO_PHASE_USE_DECODE_LATENTS", "1") == "1":
+            # Pass raw latents; decode_latents itself applies (1 / scaling_factor)
+            z = latents.to(device=vae.device, dtype=vae.dtype)
+            # Log pre-decode latent stats
+            try:
+                _log_event({
+                    "event": "sdxl_pipeline_decode_input_stats",
+                    "mean": float(z.float().mean().item()),
+                    "std": float(z.float().std().item()),
+                    "min": float(z.float().min().item()),
+                    "max": float(z.float().max().item())
+                })
+            except Exception:
+                pass
+            decoded = pipe.decode_latents(z)
+            # decode_latents returns np array [B,H,W,3] float in [0,1]
+            if decoded is not None:
+                import numpy as np
+                arr = np.clip(decoded[0], 0, 1)
+                std_val = float(arr.std())
+                from PIL import Image
+                img_pil = Image.fromarray((arr * 255).round().astype("uint8"))
+                _log_event({"event": "sdxl_pipeline_decode_latents",
+                            "ms": int((time.time()-t0)*1000),
+                            "std": std_val})
+                return img_pil, std_val
+    except Exception as e:
+        _log_exception(e, "pipeline_decode_latents")
+    # Fallback: approximate internal logic (single manual division) with timing & optional forced fp16
+    try:
+        t_dec0 = time.time()
+        _log_event({"event":"vae_decode_phase_start"})
+        force_fp16_dec = os.getenv("VAE_FORCE_FP16_DECODE","0") == "1"
+        if force_fp16_dec and vae.dtype != torch.float16:
+            with suppress(Exception):
+                vae_fp_orig = vae.dtype
+                vae.to(torch.float16)
+        z2 = (latents / scale).to(device=vae.device, dtype=vae.dtype if not force_fp16_dec else torch.float16)
+        dec = _chunked_vae_decode_if_needed(vae, z2)
+        dec_ms = int((time.time()-t_dec0)*1000)
+        _log_event({"event":"vae_decode_timed","path":"fallback_direct","ms":dec_ms,
+                    "dtype":str(vae.dtype),"force_fp16":force_fp16_dec})
+        # Slow decode mitigation: attempt one-shot slicing or tiling if extremely slow
+        if dec_ms > int(os.getenv("VAE_DECODE_SLOW_THRESH_MS","15000")) and os.getenv("VAE_SLOW_RETRY","1")=="1":
+            try:
+                _log_event({"event":"vae_decode_slow_detected","ms":dec_ms})
+                # Enable slicing & retry quickly (lightweight)
+                if hasattr(vae,"enable_slicing"):
+                    vae.enable_slicing()
+                    _log_event({"event":"vae_decode_retry_slicing_enabled"})
+                t_r = time.time()
+                with torch.inference_mode():
+                    dec2 = vae.decode(z2).sample
+                dec2_ms = int((time.time()-t_r)*1000)
+                if float(dec2.float().std().item()) > 0 and dec2_ms < dec_ms:
+                    dec = dec2
+                    _log_event({"event":"vae_decode_retry_success","ms":dec2_ms})
+                else:
+                    _log_event({"event":"vae_decode_retry_no_improve","ms":dec2_ms})
+            except Exception as e:
+                _log_exception(e,"vae_decode_retry")
+    except Exception as e:
+        _log_exception(e, "pipeline_decode_fallback_direct")
+    return img_pil, std_val
+
+def _ensure_3d(t: torch.Tensor) -> torch.Tensor:
+    if t.dim() == 2:
+        return t.unsqueeze(0)
+    return t
+
+def _invalidate_prompt_cache():
+    try:
+        _PROMPT_EMBED_CACHE.clear()
+        _PROMPT_CACHE_ORDER.clear()
+        _log_event({"event":"prompt_cache_cleared"})
+    except Exception:
+        pass
+
+def _is_diffusers_dir(p: Path) -> bool: return p.is_dir() and (p / "model_index.json").exists()
+
+def list_local_image_models() -> List[str]:
+    out=[]
+    if TEXT_TO_IMAGE_DIR.is_dir():
+        for d in TEXT_TO_IMAGE_DIR.iterdir():
+            print(f"[DEBUG] Checking: {d}")  # Add this line
+            if _is_diffusers_dir(d):
+                print(f"[DEBUG] Detected model: {d}")  # Add this line
+                out.append(str(d.resolve()))
+            else:
+                print(f"[DEBUG] Skipped (no model_index.json): {d}")  # Add this line
+    for d in MODELS_ROOT.glob("models--*"):
+        snap = d / "snapshots"
+        if snap.is_dir():
+            for s in snap.iterdir():
+                if _is_diffusers_dir(s): out.append(str(s.resolve()))
+    print(f"[DEBUG] Final detected models: {out}")  # Add this line
+    return sorted(out)
+
+def list_local_video_models() -> List[str]:
+    out=[]
+    if TEXT_TO_VIDEO_DIR.is_dir():
+        for d in TEXT_TO_VIDEO_DIR.iterdir():
+            if _is_diffusers_dir(d):
+                out.append(str(d.resolve()))
+    for d in MODELS_ROOT.iterdir():
+        name=d.name.lower()
+        if any(tag in name for tag in ("cosmos","comfy")) and _is_diffusers_dir(d):
+            out.append(str(d.resolve()))
+    if out:
+        _log_event({"event":"video_models_found","count":len(out)})
+    return sorted(set(out))
+
+def list_all_models() -> List[Dict[str,Any]]:
+    seen=set()
+    items=[]
+    def _friendly_hf_label(path_str: str) -> str:
+        p = Path(path_str)
+        parts = [x for x in p.parts]
+        try:
+            snap_idx = parts.index("snapshots")
+            repo_node = parts[snap_idx-1]
+            if repo_node.startswith("models--"):
+                segs = repo_node.split("--")[1:]
+                if len(segs) >= 2:
+                    org = segs[0]; repo = "--".join(segs[1:])
+                    label = f"{org}/{repo}"
+                    if os.getenv("SHOW_REV_HASH","0")=="1":
+                        label += f" ({parts[snap_idx+1][:7]})"
+                    if label.lower()=="runwayml/stable-diffusion-v1-5":
+                        label = "SD 1.5"
+                    return label
+        except ValueError:
+            pass
+        return Path(path_str).name
+
+    for p in list_local_image_models():
+        canon=os.path.normcase(os.path.abspath(p))
+        if canon in seen: continue
+        seen.add(canon)
+        items.append({"label":_friendly_hf_label(p),"path":p,"kind":"image"})
+    for p in list_local_video_models():
+        canon=os.path.normcase(os.path.abspath(p))
+        if canon in seen: continue
+        seen.add(canon)
+        items.append({"label":Path(p).name,"path":p,"kind":"video"})
+    if not any("stable-diffusion-xl-base" in i["path"].lower() for i in items):
+        items.append({"label":"HF: SDXL Base (hub)","path":"stabilityai/stable-diffusion-xl-base-1.0","kind":"image"})
+    _log_event({"event":"model_catalog_built","image":len([i for i in items if i['kind']=='image']),
+                "video":len([i for i in items if i['kind']=='video'])})
+    return items
+
+def _hash_key(text: str) -> str: return hashlib.sha256(text.encode("utf-8")).hexdigest()[:10]
+def _canonical(path: str) -> str:
+    try: p = str(Path(path).resolve())
+    except Exception: p = path
+    if os.name == "nt": p = os.path.normcase(p)
+    return p.replace("\\","/")
+
+def _cache_slug_for(original: str) -> str:
+    canon = _canonical(original); return f"{Path(canon).name[:48]}-{_hash_key(canon)}"
+def _resolve_cached_path(original: str) -> Optional[str]:
+    if not _DISK_CACHE_ENABLED: return None
+    slug = _cache_slug_for(original)
+    cdir = PIPELINE_DISK_CACHE_DIR / slug
+    if (cdir/"model_index.json").exists():
+        _log_event({"event":"disk_cache_hit","slug":slug})
+        return str(cdir.resolve())
     return None
 
-def _write_disk_pipeline_cache(original: str, pipe) -> None:
+def _dir_size(p: Path) -> int:
+    total=0
+    for f in p.rglob("*"):
+        if f.is_file():
+            with suppress(Exception): total += f.stat().st_size
+    return total
+
+def _prune_disk_cache():
+    if not PIPELINE_DISK_CACHE_DIR.exists(): return
+    entries=[p for p in PIPELINE_DISK_CACHE_DIR.iterdir() if (p/"model_index.json").exists()]
+    if not entries: return
+    entries.sort(key=lambda p: p.stat().st_mtime)
+    max_bytes=_DISK_CACHE_MAX_GB*(1024**3)
+    total=sum(_dir_size(e) for e in entries)
+    while (len(entries)>_DISK_CACHE_MAX_ITEMS or total>max_bytes) and entries:
+        victim=entries.pop(0)
+        freed=_dir_size(victim)
+        shutil.rmtree(victim, ignore_errors=True)
+        total-=freed
+        _log_event({"event":"disk_cache_prune","path":str(victim),"freed_bytes":freed})
+
+def _write_disk_pipeline_cache(original: str, pipe):
     if not _DISK_CACHE_ENABLED:
-        return
-    try:
-        original_canon = _canonical_path(original)
-        slug = _cache_slug_for(original_canon)
-        cdir = PIPELINE_DISK_CACHE_DIR / slug
-        if cdir.exists() and not DISK_CACHE_REBUILD:
-            return
-        if cdir.exists() and DISK_CACHE_REBUILD:
-            shutil.rmtree(cdir, ignore_errors=True)
-        print(f"[Generation] Writing disk pipeline cache: {cdir}", flush=True)
+        _log_event({"event":"disk_cache_write_skip","reason":"disabled"}); return
+    slug=_cache_slug_for(original)
+    cdir=PIPELINE_DISK_CACHE_DIR/slug
+    if cdir.exists():
+        _log_event({"event":"disk_cache_write_skip","reason":"exists","slug":slug}); return
+    with suppress(Exception):
         pipe.save_pretrained(str(cdir), safe_serialization=True)
         _log_event({"event":"disk_cache_write","slug":slug})
         _prune_disk_cache()
-        # Update mapping (dedup)
-        try:
-            map_file = PIPELINE_DISK_CACHE_DIR / "mapping.json"
-            mapping = {}
-            if map_file.exists():
-                mapping = json.loads(map_file.read_text(encoding="utf-8"))
-            mapping[original_canon] = slug
-            map_file.write_text(json.dumps(mapping, indent=2), encoding="utf-8")
-        except Exception:
-            pass
-    except Exception as e:
-        print(f"[Generation] Disk cache save failed: {e}", flush=True)
 
-def _disk_cache_entries() -> List[Path]:
-    if not PIPELINE_DISK_CACHE_DIR.exists():
-        return []
-    return [p for p in PIPELINE_DISK_CACHE_DIR.iterdir() if (p / "model_index.json").exists()]
+def is_disk_cache_enabled() -> bool: return bool(_DISK_CACHE_ENABLED)
+def set_disk_cache_enabled(enabled: bool):
+    global _DISK_CACHE_ENABLED
+    _DISK_CACHE_ENABLED = bool(enabled)
+    _log_event({"event":"disk_cache_set","enabled":_DISK_CACHE_ENABLED})
+def get_cache_stats() -> Dict[str,Any]:
+    entries=[]; total=0
+    if PIPELINE_DISK_CACHE_DIR.exists():
+        for d in PIPELINE_DISK_CACHE_DIR.iterdir():
+            if (d/"model_index.json").exists():
+                sz=_dir_size(d); total+=sz
+                entries.append({"slug":d.name,"mb":int(sz/1024**2),"files":sum(1 for _ in d.rglob("*") if _.is_file())})
+    return {"root":str(PIPELINE_DISK_CACHE_DIR),"enabled":_DISK_CACHE_ENABLED,"count":len(entries),"total_mb":int(total/1024**2),"entries":entries}
 
-def _prune_disk_cache():
-    entries = _disk_cache_entries()
-    if not entries:
-        return
-    # LRU by modified time
-    entries.sort(key=lambda p: p.stat().st_mtime)
-    # Size-based prune
-    total_bytes = sum(_dir_size(e) for e in entries)
-    max_bytes = PIPELINE_CACHE_MAX_GB * (1024**3)
-    pruned = False
-    while (len(entries) > PIPELINE_CACHE_MAX_ITEMS) or (total_bytes > max_bytes and len(entries)>1):
-        victim = entries.pop(0)
-        vsize = _dir_size(victim)
-        try:
-            shutil.rmtree(victim, ignore_errors=True)
-            total_bytes -= vsize
-            _log_event({"event":"disk_cache_prune","path":str(victim),"freed_bytes":vsize})
-            pruned = True
-        except Exception:
-            pass
-    if pruned:
-        print("[Generation] Disk cache pruned.", flush=True)
+def purge_disk_cache():
+    if PIPELINE_DISK_CACHE_DIR.exists():
+        for d in PIPELINE_DISK_CACHE_DIR.iterdir():
+            if d.is_dir(): shutil.rmtree(d, ignore_errors=True)
+        _log_event({"event":"disk_cache_purged"})
 
-def _dir_size(path: Path) -> int:
-    total = 0
-    for p in path.rglob("*"):
-        if p.is_file():
-            try: total += p.stat().st_size
-            except Exception: pass
-    return total
+def current_model_target() -> Optional[str]: return _CURRENT_TARGET
+def set_model_target(target: str):
+    global _CURRENT_TARGET
+    if not target: return
+    if _CURRENT_TARGET and _CURRENT_TARGET != target:
+        release_pipeline(free_ram=False)
+        _log_event({"event":"model_switch","from":_CURRENT_TARGET,"to":target})
+        _invalidate_prompt_cache()
+    _CURRENT_TARGET = target
 
-# ---------------- Remediation (fp16 filename) ----------------
-def _remap_diffusion_file(subdir_dir: Path, disable_env_flag: str):
-    if not subdir_dir.is_dir(): return
-    if os.environ.get(disable_env_flag) == "1": return
-    sentinel = subdir_dir / ".remap_done"
-    if sentinel.exists():
-        return
-    target = subdir_dir / "diffusion_pytorch_model.safetensors"
-    if target.exists():
-        sentinel.write_text("ok", encoding="utf-8")
-        return
-    candidates = []
-    for pat in [
-        "diffusion_pytorch_model.fp16.safetensors",
-        "diffusion_pytorch_model-fp16.safetensors",
-        "diffusion_pytorch_model_fp16.safetensors",
-        "*fp16*.safetensors",
-        "*fp32*.safetensors",
-    ]:
-        candidates.extend(subdir_dir.glob(pat))
-    cands = [c for c in candidates if c.is_file()]
-    if not cands:
-        return
-    cands.sort(key=lambda p: (0 if "fp16" in p.name.lower() else 1, len(p.name)))
-    src = cands[0]
+def _vram_snapshot(phase: str|None=None, extra: Dict[str,Any]|None=None):
+    if not torch.cuda.is_available(): return
+    global _LAST_VRAM_SNAPSHOT
     try:
-        if hasattr(os, "link"):
-            os.link(src, target)
-        else:
-            shutil.copyfile(src, target)
-        print(f"[Generation] Remap {subdir_dir.name}: {src.name} -> {target.name}", flush=True)
-        sentinel.write_text("ok", encoding="utf-8")
-    except Exception as e:
-        print(f"[Generation] Remap failed ({subdir_dir.name}): {e}", flush=True)
-
-# Extend remediation patterns to include generic 'model.safetensors' alias in text_encoder dirs.
-def _remap_generic_model(subdir: Path):
-    """
-    Ensure model.safetensors exists if only model.fp16.safetensors (or related) present.
-    """
-    if not subdir.is_dir(): return
-    target = subdir / "model.safetensors"
-    if target.exists(): return
-    cands = []
-    for pat in ["model.fp16.safetensors","model-fp16.safetensors","*fp16*.safetensors","model.sft","pytorch_model.safetensors"]:
-        cands.extend(subdir.glob(pat))
-    cands = [c for c in cands if c.is_file()]
-    if not cands: return
-    cands.sort(key=lambda p: (0 if "fp16" in p.name.lower() else 1, len(p.name)))
-    src = cands[0]
-    try:
-        if hasattr(os, "link"):
-            os.link(src, target)
-        else:
-            shutil.copyfile(src, target)
-        print(f"[Generation] Remap generic model: {src.name} -> {target.name}", flush=True)
-    except Exception as e:
-        print(f"[Generation] Generic model remap failed: {e}", flush=True)
-
-def _cold_load_remediate(model_root: Path):
-    fast = os.environ.get("FAST_DIFFUSERS_LOAD") == "1"
-    if fast:
-        vae_ok = (model_root / "vae" / "diffusion_pytorch_model.safetensors").exists()
-        unet_ok = (model_root / "unet" / "diffusion_pytorch_model.safetensors").exists()
-        if vae_ok and unet_ok:
-            return
-    _remap_diffusion_file(model_root / "vae", "DISABLE_VAE_FP16_REMAP")
-    _remap_diffusion_file(model_root / "unet", "DISABLE_UNET_FP16_REMAP")
-    _remap_generic_model(model_root / "text_encoder")
-    _remap_generic_model(model_root / "text_encoder_2")
-
-# ---------------- Shared text encoder reuse ----------------
-def _collect_te_state_dirs(root: Path) -> List[Path]:
-    out=[]
-    for name in ("text_encoder","text_encoder_2"):
-        d = root / name
-        if d.exists(): out.append(d)
-    return out
-
-def _hash_dir_files(d: Path) -> str:
-    h = hashlib.sha256()
-    for p in sorted(d.rglob("*.safetensors")):
-        try:
-            h.update(p.name.encode())
-            h.update(str(p.stat().st_size).encode())
-        except Exception:
-            pass
-    return h.hexdigest()[:16]
-
-def _maybe_reuse_text_encoders(root: Path, pipe):
-    try:
-        dirs = _collect_te_state_dirs(root)
-        for d in dirs:
-            sig = _hash_dir_files(d)
-            if not sig:
-                continue
-            if sig in _SHARED_TEXT_ENCODERS:
-                # swap in existing module (attribute names vary)
-                attr = "text_encoder_2" if "text_encoder_2" in d.name else "text_encoder"
-                # Some pipelines use pipe.text_encoder / pipe.text_encoder_2
-                if hasattr(pipe, attr):
-                    setattr(pipe, attr, _SHARED_TEXT_ENCODERS[sig])
-                    _log_event({"event":"text_encoder_reuse","which":attr,"sig":sig})
-            else:
-                # Register new
-                attr = "text_encoder_2" if d.name == "text_encoder_2" else "text_encoder"
-                mod = getattr(pipe, attr, None)
-                if mod is not None:
-                    _SHARED_TEXT_ENCODERS[sig] = mod
+        torch.cuda.synchronize()
+        alloc=int(torch.cuda.memory_allocated()//1024**2)
+        reserved=int(torch.cuda.memory_reserved()//1024**2)
+        key=_CURRENT_TARGET or "none"
+        dedup=os.environ.get("VRAM_SNAPSHOT_DEDUP","1")!="0"
+        changed=_LAST_VRAM_SNAPSHOT!=(alloc,reserved,key)
+        if (not dedup) or phase or changed:
+            rec={"event":"vram_snapshot","alloc_mb":alloc,"reserved_mb":reserved,
+                 "target":_CURRENT_TARGET,"has_pipeline":_PIPELINE is not None}
+            if phase: rec["phase"]=phase
+            if extra: rec.update(extra)
+            _log_event(rec)
+            _LAST_VRAM_SNAPSHOT=(alloc,reserved,key)
     except Exception:
         pass
 
-# ---------------- Pipeline loader ----------------
-def _load_pipeline(device: str = "cuda", sampler: str = ""):
-    global _PIPELINE, _PIPELINE_MODEL_ID, _DEVICE, _PIPELINE_CACHE
-    with _LOCK:
-        target, is_local = _classify_target()
-        if is_video_path(target):
-            raise RuntimeError("Selected video model; image pipeline not applicable.")
-        from diffusers import StableDiffusionPipeline, StableDiffusionXLPipeline
-        use_cuda = (device == "cuda" and torch.cuda.is_available())
-        model_path = Path(target) if is_local else None
+def _select_pipeline_class(target:str):
+    return StableDiffusionXLPipeline if "xl" in target.lower() else StableDiffusionPipeline
 
-        cached_override = _resolve_cached_path(target) if is_local else None
-        if cached_override:
-            target = cached_override
-            model_path = Path(target)
-            is_local = True
-            print(f"[Generation] Using disk-cached pipeline: {target}", flush=True)
+def _apply_scheduler(pipe, name:str):
+    global LAST_SCHEDULER_NAME
+    if not name: name=os.environ.get("DEFAULT_SCHEDULER","")
+    if not name or name==LAST_SCHEDULER_NAME: return
+    cls=_SCHEDULER_MAP.get(name.lower())
+    if not cls: return
+    t0=time.time()
+    try:
+        cfg=pipe.scheduler.config
+        if "dpmpp" in name.lower() and hasattr(cls,"from_config"):
+            cfgd=dict(cfg); cfgd.update({"use_karras_sigmas":True,"algorithm_type":"dpmsolver++","solver_order":2,"timestep_spacing":"trailing"})
+            pipe.scheduler=cls.from_config(cfgd)
+        else:
+            pipe.scheduler=cls.from_config(cfg)
+        LAST_SCHEDULER_NAME=name
+        _log_event({"event":"scheduler_set","name":name,"ms":int((time.time()-t0)*1000)})
+    except Exception as e:
+        _log_exception(e,"scheduler_set")
 
-        pipeline_cls = _select_pipeline_class(model_path) if (is_local and model_path) else (
-            StableDiffusionXLPipeline if "xl" in target.lower() else StableDiffusionPipeline
-        )
-        cache_key = (target, 'cuda' if use_cuda else 'cpu')
-        if cache_key in _PIPELINE_CACHE:
-            pipe = _PIPELINE_CACHE[cache_key]
-            _PIPELINE = pipe
-            _PIPELINE_MODEL_ID = target
-            _DEVICE = cache_key[1]
-            if cache_key in _PIPELINE_CACHE_ORDER:
-                _PIPELINE_CACHE_ORDER.remove(cache_key)
-            _PIPELINE_CACHE_ORDER.append(cache_key)
-            _apply_scheduler(pipe, sampler)
-            return _PIPELINE
+def validate_local_model(path:str)->Tuple[bool,List[str]]:
+    p=Path(path); issues=[]
+    if not p.exists(): issues.append("path_missing")
+    if not (p/"model_index.json").exists(): issues.append("model_index.json missing")
+    return (len(issues)==0, issues)
 
-        t0 = time.time()
-        print(f"[Generation] Cold load start: {target}", flush=True)
-
-        if is_local and model_path and not str(model_path).startswith(str(PIPELINE_DISK_CACHE_DIR)):
-            _cold_load_remediate(model_path)
-
-        dtype = torch.float16 if use_cuda else torch.float32
-        load_kwargs = dict(
-            torch_dtype=dtype,
-            use_safetensors=True,
-            local_files_only=os.environ.get("DIFFUSERS_FORCE_LOCAL_FILES") == "1",
-            low_cpu_mem_usage=True,
-        )
-        if pipeline_cls.__name__.endswith("XLPipeline"):
-            load_kwargs["safety_checker"] = None
-
-        # Fallback logic: if text_encoder_2 missing, drop it from components
-        try:
-            pipe = pipeline_cls.from_pretrained(target, **load_kwargs)
-        except ValueError as e:
-            print(f"[Generation] Retry minimal load due to error: {e}", flush=True)
-            load_kwargs = dict(torch_dtype=dtype)
-            if pipeline_cls.__name__.endswith("XLPipeline"):
-                load_kwargs["safety_checker"] = None
-            pipe = pipeline_cls.from_pretrained(target, **load_kwargs)
-        except OSError as e:
-            msg = str(e).lower()
-            if "text_encoder_2" in msg or "model.safetensors" in msg:
-                print("[Generation] Missing second text encoder – retry lite SDXL (single encoder).", flush=True)
-                # Force pipeline to treat as non-XL if second encoder missing
-                from diffusers import StableDiffusionPipeline
-                pipeline_cls = StableDiffusionPipeline
-                lite_kwargs = dict(torch_dtype=dtype, use_safetensors=True, local_files_only=load_kwargs.get("local_files_only", False), low_cpu_mem_usage=True, safety_checker=None)
-                pipe = pipeline_cls.from_pretrained(target, **lite_kwargs)
-                _log_event({"event":"sdxl_lite_mode","model":target})
-            else:
-                raise
-
-        if use_cuda:
-            pipe.to("cuda")
-
-        # Shared text encoders (reuse)
-        if is_local and model_path:
-            _maybe_reuse_text_encoders(model_path, pipe)
-
-        try:
-            gpu_mem = torch.cuda.get_device_properties(0).total_memory // (1024**3) if use_cuda else 0
-        except Exception:
-            gpu_mem = 0
-        if use_cuda and gpu_mem <= 10:
-            if hasattr(pipe, "enable_attention_slicing"):
-                try: pipe.enable_attention_slicing()
-                except Exception: pass
-        if use_cuda and hasattr(pipe, "enable_xformers_memory_efficient_attention"):
-            try: pipe.enable_xformers_memory_efficient_attention()
-            except Exception: pass
-
-        _apply_scheduler(pipe, sampler)
-
-        _PIPELINE_CACHE[cache_key] = pipe
-        _PIPELINE_CACHE_ORDER.append(cache_key)
-        while len(_PIPELINE_CACHE_ORDER) > _PIPELINE_CACHE_MAX:
-            old = _PIPELINE_CACHE_ORDER.pop(0)
-            if old == cache_key: continue
-            old_pipe = _PIPELINE_CACHE.pop(old, None)
-            try:
-                if hasattr(old_pipe, "to"):
-                    old_pipe.to("cpu")
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:
-                pass
-        _PIPELINE = pipe
-        _PIPELINE_MODEL_ID = target
-        _DEVICE = cache_key[1]
-        load_ms = int((time.time() - t0)*1000)
-        _log_event({"event":"model_load_time","model":target,"ms":load_ms})
-        print(f"[Generation] Cold load done in {load_ms} ms: {target}", flush=True)
-
-        # Write disk cache if not already cached
-        if _DISK_CACHE_ENABLED and is_local and model_path and not str(model_path).startswith(str(PIPELINE_DISK_CACHE_DIR)):
-            _write_disk_pipeline_cache(original_target, pipe)
-            # Persist mapping so next process start can directly use cache (write mapping file)
-            try:
-                map_file = PIPELINE_DISK_CACHE_DIR / "mapping.json"
-                mapping = {}
-                if map_file.exists():
-                    mapping = json.loads(map_file.read_text(encoding="utf-8"))
-                slug = _cache_slug_for(model_path.as_posix())
-                mapping[model_path.as_posix()] = slug
-                map_file.write_text(json.dumps(mapping, indent=2), encoding="utf-8")
-            except Exception:
-                pass
-        return _PIPELINE
-
-# ---------------- Torch compile (async) ----------------
-def _async_compile_unet(pipe):
-    if not hasattr(pipe, "unet"):
+def _patch_vae_decode(pipe):
+    vae = getattr(pipe, "vae", None)
+    if not vae or getattr(vae, "_decode_patched", False):
         return
-    def _run():
+    orig = vae.decode
+    ref_param = next(vae.parameters(), None)
+    ref_dtype = ref_param.dtype if ref_param is not None else getattr(vae, "dtype", torch.float32)
+    def _coerce(z):
+        if torch.is_tensor(z):
+            target_dtype = ref_dtype or vae.dtype
+            if z.dtype != target_dtype:
+                with suppress(Exception):
+                    z = z.to(dtype=target_dtype, device=vae.device, non_blocking=True)
+        return z
+    prof = os.getenv("VAE_DECODE_PROF","0") == "1"
+    def safe_decode(z, *a, **k):
+        z = _coerce(z)
         try:
-            _log_event({"event":"torch_compile_start"})
-            unet = pipe.unet
-            # Warm dummy forward (small)
-            with torch.inference_mode():
-                sample = torch.randn(1, unet.in_channels, 64, 64, generator=torch.Generator(device=unet.device))
-                # Some UNets need timestep & encoder hidden states; attempt generic call
+            t0 = time.time() if prof else None
+            out = orig(z, *a, **k)
+            if prof and t0 is not None:
                 try:
-                    if "timestep" in unet.forward.__code__.co_varnames:
-                        unet(sample, 0.0)
-                    else:
-                        unet(sample)
+                    _log_event({
+                        "event":"vae_decode_call",
+                        "ms": int((time.time()-t0)*1000),
+                        "dtype": str(getattr(z, "dtype", None)),
+                        "shape": list(getattr(z, "shape", []))
+                    })
                 except Exception:
                     pass
-            compiled = torch.compile(unet, mode=TORCH_COMPILE_MODE, backend=TORCH_COMPILE_BACKEND)
-            pipe.unet = compiled
-            _log_event({"event":"torch_compile_done"})
-            print("[Generation] UNet torch.compile complete.", flush=True)
-        except Exception as e:
-            print(f"[Generation] torch.compile skipped: {e}", flush=True)
-    threading.Thread(target=_run, daemon=True).start()
+            return out
+        except RuntimeError as e:
+            msg = str(e)
+            if ("Input type (float) and bias type" in msg or "input type (float)" in msg):
+                try:
+                    z = _coerce(z)
+                    return orig(z, *a, **k)
+                except Exception as e2:
+                    try:
+                        vae.float()
+                        _log_event({"event":"sdxl_vae_auto_upcast_fp32"})
+                        z2 = z.float() if torch.is_tensor(z) else z
+                        return orig(z2, *a, **k)
+                    except Exception as e3:
+                        _log_exception(e3, "vae_decode_retry_fail")
+                    _log_exception(e2, "vae_decode_retry_error")
+            raise
+    vae.decode = safe_decode  # type: ignore
+    setattr(vae, "_decode_patched", True)
+    _log_event({"event": "vae_decode_patched", "dtype": str(getattr(vae, 'dtype', None))})
 
-# ---------------- Prefetch (multiprocess) ----------------
-def _prefetch_worker(model_paths: List[str]):
-    os.environ["DISK_PIPELINE_CACHE"] = "1"
-    for p in model_paths:
+def _self_test_vae(pipe, model_path: str):
+    vae = getattr(pipe, "vae", None)
+    if vae is None:
+        return
+    try:
+        with torch.inference_mode():
+            lat = torch.randn(1, 4, 64, 64, device=vae.device, dtype=vae.dtype)
+            dec = vae.decode(lat).sample
+            base_std = float(dec.float().std().item())
+        if base_std < 0.02:
+            _log_event({"event": "sdxl_vae_selftest_fail", "std": base_std})
+            try:
+                vae.float()
+                with torch.inference_mode():
+                    lat2 = torch.randn(1, 4, 64, 64, device=vae.device, dtype=torch.float32)
+                    dec2 = vae.decode(lat2).sample
+                    std2 = float(dec2.float().std().item())
+                if std2 >= 0.02:
+                    _log_event({"event": "sdxl_vae_selftest_recover_fp32", "std": std2})
+                    return
+            except Exception as e:
+                _log_exception(e, "vae_selftest_upcast")
+            try:
+                from diffusers import AutoencoderKL
+                new_vae = AutoencoderKL.from_pretrained(model_path, subfolder="vae", torch_dtype=torch.float32)
+                new_vae.to(vae.device)
+                pipe.vae = new_vae
+                with torch.inference_mode():
+                    lat3 = torch.randn(1, 4, 64, 64, device=new_vae.device, dtype=new_vae.dtype)
+                    dec3 = new_vae.decode(lat3).sample
+                    std3 = float(dec3.float().std().item())
+                if std3 < 0.02:
+                    os.environ["DISABLE_SDXL_MANUAL_DECODE"] = "1"
+                    os.environ["SDXL_TWO_PHASE"] = "0"
+                    _log_event({"event": "sdxl_manual_decode_disabled_fallback", "std": std3})
+                else:
+                    _log_event({"event": "sdxl_vae_reloaded", "std": std3})
+                return
+            except Exception as e:
+                _log_exception(e, "vae_reload_fail")
+                os.environ["DISABLE_SDXL_MANUAL_DECODE"] = "1"
+                os.environ["SDXL_TWO_PHASE"] = "0"
+                _log_event({"event": "sdxl_manual_decode_disabled_fallback"})
+    except Exception as e:
+        _log_exception(e, "vae_selftest")
+
+def _align_pipeline_dtypes(pipe):
+    """
+    Safe alignment:
+      - Default: allow mixed precision (VAE fp32, UNet fp16) to save VRAM.
+      - Set DTYPE_ALIGN_STRICT=1 to force UNet to match VAE.
+      - Set DTYPE_ALIGN_MATCH_UNET=1 to downcast VAE to UNet dtype instead.
+      - Auto-downgrade UNet if VRAM usage exceeds UNET_DOWNGRADE_THRESH (fraction).
+    """
+    if os.getenv("ENABLE_DTYPE_ALIGN", "1") != "1":
+        return
+    vae = getattr(pipe, "vae", None)
+    unet = getattr(pipe, "unet", None)
+    if not vae or not unet:
+        return
+    strict = os.getenv("DTYPE_ALIGN_STRICT", "0") == "1"
+    match_unet = os.getenv("DTYPE_ALIGN_MATCH_UNET", "0") == "1"
+    allow_mixed = not strict and not match_unet
+    changed = False
+    action = "noop"
+    try:
+        if allow_mixed:
+            # Mixed is acceptable; do nothing unless VAE lower precision than UNet (rare)
+            if vae.dtype == torch.float16 and unet.dtype == torch.float32:
+                with suppress(Exception):
+                    vae.to(unet.dtype)
+                    changed = True
+                    action = "vae_upcast_to_unet"
+            else:
+                action = "mixed_ok"
+        elif strict:
+            if unet.dtype != vae.dtype:
+                with suppress(Exception):
+                    unet.to(vae.dtype)
+                    changed = True
+                    action = f"unet_to_{vae.dtype}"
+        elif match_unet:
+            if vae.dtype != unet.dtype:
+                with suppress(Exception):
+                    vae.to(unet.dtype)
+                    changed = True
+                    action = f"vae_to_{unet.dtype}"
+    except Exception as e:
+        _log_exception(e, "dtype_align")
+        action = "error"
+    _log_event({
+        "event": "dtype_align",
+        "vae": str(getattr(vae, "dtype", None)),
+        "unet": str(getattr(unet, "dtype", None)),
+        "changed": changed,
+        "mode": ("strict" if strict else "match_unet" if match_unet else "mixed"),
+        "action": action
+    })
+    _maybe_autodowngrade_unet(pipe)
+
+def _maybe_autodowngrade_unet(pipe):
+    if os.getenv("UNET_AUTODOWNGRADE", "1") != "1":
+        return
+    if not torch.cuda.is_available():
+        return
+    thresh = float(os.getenv("UNET_DOWNGRADE_THRESH", "0.88"))
+    try:
+        unet = getattr(pipe, "unet", None)
+        if not unet:
+            return
+        if unet.dtype == torch.float16:
+            return
+        total = torch.cuda.get_device_properties(0).total_memory
+        torch.cuda.synchronize()
+        reserved = torch.cuda.memory_reserved()
+        usage = reserved / total
+        if usage >= thresh:
+            with suppress(Exception):
+                unet.to(torch.float16)
+                _log_event({
+                    "event": "unet_autodowngrade_fp16",
+                    "usage_pct": round(usage * 100, 2)
+                })
+    except Exception as e:
+        _log_exception(e, "unet_autodowngrade")
+
+# --- Memory format + optional compile helpers (re-added) ---
+
+def _apply_memory_format(pipe):
+    """
+    Set memory_format for major submodules:
+      - UNet: channels_last is usually faster on CUDA.
+      - VAE: prefer contiguous on SDXL/Turbo (stable on Windows).
+        Set DISABLE_VAE_CHANNELS_LAST=0 to allow channels_last for non-SDXL.
+    """
+    t = time.time()
+    try:
+        with suppress(Exception):
+            if hasattr(pipe, "unet"):
+                pipe.unet.to(memory_format=torch.channels_last)
+            if hasattr(pipe, "vae"):
+                disable_vae_cl = os.getenv("DISABLE_VAE_CHANNELS_LAST", "1") == "1"
+                is_xl = "xl" in (current_model_target() or "").lower()
+                if disable_vae_cl or is_xl:
+                    pipe.vae.to(memory_format=torch.contiguous_format)
+                else:
+                    pipe.vae.to(memory_format=torch.channels_last)
+    finally:
+        _log_event({
+            "event": "model_load_phase",
+            "phase": "memory_format",
+            "ms": int((time.time()-t)*1000)
+        })
+
+_COMPILED = False
+import platform
+
+def _maybe_compile(pipe):
+    """
+    Optionally compile UNet with torch.compile when ENABLE_TORCH_COMPILE=1.
+    On Windows, requires triton; otherwise we skip safely.
+    """
+    global _COMPILED
+    if _COMPILED or os.getenv("ENABLE_TORCH_COMPILE","0") != "1":
+        return
+    if platform.system() == "Windows":
         try:
-            os.environ[ENV_KEY] = p
-            _ = _load_pipeline(device="cuda" if torch.cuda.is_available() else "cpu", sampler="euler_a")
+            import triton  # noqa: F401
         except Exception:
-            pass
+            _log_event({"event":"torch_compile_skip","reason":"no_triton_windows"})
+            return
+    t = time.time()
+    try:
+        pipe.unet = torch.compile(
+            pipe.unet,
+            mode="reduce-overhead",
+            fullgraph=False,
+            backend="inductor"
+        )
+        _COMPILED = True
+        _log_event({"event":"torch_compile_unet","backend":"inductor","ms": int((time.time()-t)*1000)})
+    except Exception as e:
+        _log_exception(e, "torch_compile_unet")
+        _log_event({"event":"torch_compile_skip","reason":type(e).__name__})
 
-def start_prefetch():
-    if not PREFETCH_MODELS:
-        return
-    imgs = list_local_image_models()
-    # Exclude currently loaded
-    current = current_model_target()
-    remaining = [p for p in imgs if p != current][:4]  # cap
-    if not remaining:
-        return
-    _log_event({"event":"prefetch_start","count":len(remaining)})
-    proc = mp.Process(target=_prefetch_worker, args=(remaining,), daemon=True)
-    proc.start()
+_COMPILED_VAE = False
 
-# ---------------- Public generation functions ----------------
-def generate_images(
+def _maybe_compile_vae(pipe):
+    """
+    Optionally compile VAE with torch.compile when ENABLE_TORCH_COMPILE_VAE=1.
+    On Windows, requires triton; otherwise we skip safely.
+    """
+    global _COMPILED_VAE
+    if _COMPILED_VAE or os.getenv("ENABLE_TORCH_COMPILE_VAE","0") != "1":
+        return
+    if platform.system() == "Windows":
+        try:
+            import triton  # noqa: F401
+        except Exception:
+            _log_event({"event":"torch_compile_vae_skip","reason":"no_triton_windows"})
+            return
+    t = time.time()
+    try:
+        pipe.vae = torch.compile(
+            pipe.vae,
+            mode="reduce-overhead",
+            fullgraph=False,
+            backend="inductor"
+        )
+        _COMPILED_VAE = True
+        _log_event({"event":"torch_compile_vae","backend":"inductor","ms": int((time.time()-t)*1000)})
+    except Exception as e:
+        _log_exception(e, "torch_compile_vae")
+        _log_event({"event":"torch_compile_vae_skip","reason":type(e).__name__})
+
+def _load_pipeline(device:str, sampler:str):
+    global _PIPELINE,_PIPELINE_DEVICE
+    with _LOCK:
+        if _PIPELINE and _PIPELINE_DEVICE==device:
+            _apply_scheduler(_PIPELINE, sampler)
+            return _PIPELINE
+        if not _CURRENT_TARGET: raise RuntimeError("No model target set.")
+        tgt=_CURRENT_TARGET
+        is_local= not ("/" in tgt and not Path(tgt).exists())
+        if is_local:
+            ok,issues=validate_local_model(tgt)
+            if not ok:
+                _log_event({"event":"model_validation_failed","target":tgt,"issues":issues})
+                raise RuntimeError(f"Invalid model dir: {issues}")
+        cached=_resolve_cached_path(tgt) if is_local else None
+        load_path=cached or tgt
+        if is_local and not ok:
+            _log_event({"event":"disk_cache_write_skip","reason":"model_invalid","issues":issues,"slug":_cache_slug_for(tgt)})
+        use_cuda=(device=="cuda" and torch.cuda.is_available())
+        dtype=torch.float16 if use_cuda else torch.float32
+        pipe_cls=_select_pipeline_class(load_path)
+        t_from=time.time()
+        pipe=pipe_cls.from_pretrained(load_path,
+                                      torch_dtype=dtype,
+                                      use_safetensors=True,
+                                      low_cpu_mem_usage=True,
+                                      safety_checker=None,
+                                      local_files_only=False)
+
+        # --- Model-specific defaults right after load ---
+        if "turbo" in tgt.lower():
+            # Dreamshaper XL V2 Turbo
+            try:
+                pipe.unet.to(torch.float16)
+                force_vae_fp32 = os.getenv("TURBO_FORCE_VAE_FP32", "1") == "1"
+                if force_vae_fp32:
+                    pipe.vae.float()
+                else:
+                    pipe.vae.to(torch.float16)
+                pipe.vae.to(memory_format=torch.contiguous_format)
+                if hasattr(pipe.vae, "disable_slicing"):
+                    pipe.vae.disable_slicing()
+                    _log_event({"event": "vae_slicing_disabled", "reason": "turbo"})
+                if hasattr(pipe.vae, "disable_tiling"):
+                    pipe.vae.disable_tiling()
+                    _log_event({"event": "vae_tiling_disabled", "reason": "turbo"})
+                print(f"[Dreamshaper Turbo] VAE {'FP32' if force_vae_fp32 else 'FP16'}; slicing/tiling disabled.")
+                if _XFORMERS_AVAILABLE and hasattr(pipe, "enable_xformers_memory_efficient_attention"):
+                    pipe.enable_xformers_memory_efficient_attention()
+            except Exception as e:
+                print(f"[Dreamshaper Turbo] Setup failed: {e}")
+        elif isinstance(pipe, StableDiffusionXLPipeline):
+            # SDXL 1.0 base: FP32 VAE; slicing/tiling will be decided per-shape at generation time
+            try:
+                pipe.vae.float()
+                pipe.vae.to(memory_format=torch.contiguous_format)
+                # Avoid forcing slicing on load; generation step will toggle as needed.
+                if hasattr(pipe.vae, "disable_slicing"):
+                    pipe.vae.disable_slicing()
+                    _log_event({"event":"sdxl_vae_slicing_default_off"})
+                if hasattr(pipe.vae, "disable_tiling"):
+                    pipe.vae.disable_tiling()
+                print("[SDXL] VAE FP32; slicing decided per image size.")
+                _log_event({"event":"sdxl_vae_fp32_forced"})
+            except Exception as e:
+                print(f"[SDXL] VAE FP32/contiguous failed: {e}")
+        # ------------------------------------------------
+
+        _log_event({"event":"model_load_phase","phase":"from_pretrained","ms":int((time.time()-t_from)*1000),"cached":bool(cached)})
+        _maybe_enable_memory_opts(pipe)
+        _apply_memory_format(pipe)
+
+        _align_pipeline_dtypes(pipe)
+        t_dtype=time.time()
+        if use_cuda and _should_use_bf16(pipe_cls, tgt):
+            with suppress(Exception):
+                pipe.to(torch.bfloat16)
+                os.environ["ENABLE_DTYPE_ALIGN"] = "0"
+                _log_event({"event":"pipeline_dtype","dtype":"bfloat16"})
+                if hasattr(pipe,"vae"):
+                    pipe.vae.to(dtype=torch.float16); _log_event({"event":"vae_forced_fp16"})
+        elif (use_cuda and hasattr(pipe,"vae")
+              and os.getenv("FORCE_FP16_VAE","1")=="1"
+              and os.getenv("DISABLE_FP16_VAE","0")!="1"
+              and "turbo" not in tgt.lower()
+              and not isinstance(pipe, StableDiffusionXLPipeline)):
+            with suppress(Exception):
+                pipe.vae.to(torch.float16); _log_event({"event":"vae_fp16_enforced"})
+        _log_event({"event":"model_load_phase","phase":"dtype_adjust","ms":int((time.time()-t_dtype)*1000)})
+
+        t_move=time.time()
+        if use_cuda: pipe.to("cuda")
+        _log_event({"event":"model_load_phase","phase":"move_to_cuda","ms":int((time.time()-t_move)*1000)})
+        _apply_scheduler(pipe, sampler)
+        _PIPELINE,_PIPELINE_DEVICE=pipe,device
+        if is_local and not cached and _DISK_CACHE_ENABLED: _write_disk_pipeline_cache(tgt, pipe)
+        _vram_snapshot("post_load", {"model":load_path})
+        _maybe_compile(pipe)
+        _maybe_compile_vae(pipe)
+
+        # Force DPM++ 2M Karras for SDXL base only (keep user's sampler for Turbo)
+        with suppress(Exception):
+            if isinstance(pipe, StableDiffusionXLPipeline) and "turbo" not in tgt.lower():
+                cfg=dict(pipe.scheduler.config)
+                cfg.update({"use_karras_sigmas":True,"algorithm_type":"dpmsolver++","solver_order":2,"timestep_spacing":"trailing"})
+                pipe.scheduler=DPMSMS.from_config(cfg)
+                _log_event({"event":"scheduler_set_forced","name":"dpmpp_2m_karras"})
+
+        # Do not auto-enable VAE slicing here; handled per image in generate_images
+        _patch_vae_decode(pipe)
+        _align_pipeline_dtypes(pipe)
+        _self_test_vae(pipe, load_path)
+
+        if os.getenv("WARMUP_ENABLE","1")=="1" and not cached:
+            t_w=time.time()
+            with suppress(Exception):
+                with torch.inference_mode():
+                    _=pipe(prompt="warmup", negative_prompt=None,num_inference_steps=2,guidance_scale=0.0,width=512,height=512).images
+                _log_event({"event":"warmup_done","ms":int((time.time()-t_w)*1000)})
+        else:
+            _log_event({"event":"warmup_skipped","reason":("cached" if cached else "disabled")})
+
+        ms_total=int((time.time()-t_from)*1000)
+        _log_event({"event":"model_load_time","model":load_path,"ms":ms_total,"cached":bool(cached)})
+        return _PIPELINE
+
+def release_pipeline(free_ram: bool=False):
+    global _PIPELINE,_PIPELINE_DEVICE
+    with _LOCK:
+        if not _PIPELINE: return
+        with suppress(Exception):
+            with torch.no_grad(): _PIPELINE.to("cpu")
+        if free_ram: _PIPELINE=None
+        _PIPELINE_DEVICE=None
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+        gc.collect()
+        _vram_snapshot("release", {"free_ram":free_ram})
+
+def force_load_pipeline(sampler:str="euler_a", device:str="cuda")->bool:
+    if not _CURRENT_TARGET: raise RuntimeError("No model target set.")
+    try: _load_pipeline(device=device, sampler=sampler); return True
+    except Exception as e:
+        _log_exception(e,"force_load_pipeline"); return False
+
+_PROMPT_EMBED_CACHE: Dict[str, Dict[str, Any]] = {}
+_PROMPT_CACHE_ORDER: List[str] = []
+def _cache_key(prompt:str, neg:str, cfg:float, w:int,h:int, device:str)->str:
+    return hashlib.sha256(((current_model_target() or "")+"\n"+prompt+"\n"+neg+f"\n{cfg}\n{w}x{h}\n{device}").encode("utf-8")).hexdigest()
+def _get_prompt_embeds(pipe, prompt:str, negative:str, cfg:float, w:int,h:int, device:str):
+    if os.getenv("ENABLE_PROMPT_CACHE","1")!="1": return None
+    encode_fn=getattr(pipe,"_encode_prompt",None)
+    if encode_fn is None: return None
+
+    key=_cache_key(prompt, negative, cfg, w, h, device)
+    rec=_PROMPT_EMBED_CACHE.get(key)
+    if rec:
+        _log_event({"event":"prompt_cache_hit"}); return rec["pos"],rec["neg"]
+
+    # Chunking setup
+    use_chunking = (os.getenv("ENABLE_PROMPT_CHUNKING","1") == "1")
+    tokenizer = getattr(pipe, "tokenizer", None)
+    # SDXL has two tokenizers; we use the primary for length decisions
+    if tokenizer is None:
+        with suppress(Exception):
+            tokenizer = getattr(pipe, "tokenizer_2", None)
+
+    # Determine effective token limit (reserve room for special tokens)
+    eff_max = None
+    if tokenizer is not None:
+        with suppress(Exception):
+            eff_max = int(getattr(tokenizer, "model_max_length", 77) or 77)
+    # Allow env override
+    with suppress(Exception):
+        ov = int(os.getenv("CHUNK_MAX_TOKENS","0") or "0")
+        if ov > 0:
+            eff_max = ov
+    if eff_max is None:
+        eff_max = 77
+    eff_body = max(8, eff_max - 2)  # reserve a couple for special tokens
+
+    def _within(text: str) -> bool:
+        try:
+            if tokenizer is None:
+                return len((text or "").split()) <= eff_body
+            # Prefer excluding special tokens
+            return len(tokenizer.encode(text or "", add_special_tokens=False)) <= eff_body
+        except TypeError:
+            return len(tokenizer.encode(text or "")) <= eff_body
+        except Exception:
+            return len((text or "").split()) <= eff_body
+
+    # If no chunking or both within limit, do normal encode
+    if (not use_chunking) or (_within(prompt) and _within(negative or "")):
+        try:
+            pos,neg = encode_fn(
+                prompt=prompt,
+                negative_prompt=negative or None,
+                device=device,
+                num_images_per_prompt=1,
+                do_classifier_free_guidance=True
+            )
+            if torch.is_tensor(pos) and pos.dim()==2:
+                pos=_ensure_3d(pos); _log_event({"event":"prompt_cache_shape_fix","which":"pos"})
+            if torch.is_tensor(neg) and neg.dim()==2:
+                neg=_ensure_3d(neg); _log_event({"event":"prompt_cache_shape_fix","which":"neg"})
+            _PROMPT_EMBED_CACHE[key]={"pos":pos,"neg":neg,"ts":time.time()}
+            _PROMPT_CACHE_ORDER.append(key)
+            max_items=int(os.getenv("MAX_PROMPT_CACHE","64"))
+            if len(_PROMPT_CACHE_ORDER)>max_items:
+                old=_PROMPT_CACHE_ORDER.pop(0); _PROMPT_EMBED_CACHE.pop(old, None)
+            _log_event({"event":"prompt_cache_store","size":len(_PROMPT_CACHE_ORDER)})
+            return pos, neg
+        except Exception as e:
+            _log_exception(e,"prompt_cache_encode")
+            return None
+
+    # Chunked path
+    try:
+        from src.modules.chunking_module import chunk_text
+    except Exception as e:
+        _log_exception(e, "prompt_chunk_import")
+        return None
+
+    # Build chunks
+    pos_chunks = chunk_text(prompt or "", max_tokens=eff_body, tokenizer=tokenizer)
+    neg_needs_chunk = bool(negative) and (not _within(negative))
+    neg_chunks = chunk_text(negative or "", max_tokens=eff_body, tokenizer=tokenizer) if neg_needs_chunk else None
+
+    # Helper: weigh a chunk by its token count
+    def _weight_for(text: str) -> float:
+        try:
+            if tokenizer is None:
+                return float(max(1, len((text or "").split())))
+            try:
+                return float(len(tokenizer.encode(text or "", add_special_tokens=False)))
+            except TypeError:
+                return float(len(tokenizer.encode(text or "")))
+        except Exception:
+            return 1.0
+
+    pos_list=[]; neg_list=[]; w_list=[]
+    for i, cp in enumerate(pos_chunks):
+        cn = None
+        if negative:
+            if neg_chunks is not None:
+                cn = neg_chunks[min(i, len(neg_chunks)-1)]
+            else:
+                cn = negative
+        try:
+            p_i, n_i = encode_fn(
+                prompt=cp,
+                negative_prompt=cn or None,
+                device=device,
+                num_images_per_prompt=1,
+                do_classifier_free_guidance=True
+            )
+            if torch.is_tensor(p_i) and p_i.dim()==2: p_i=_ensure_3d(p_i)
+            if torch.is_tensor(n_i) and n_i.dim()==2: n_i=_ensure_3d(n_i)
+            pos_list.append(p_i); neg_list.append(n_i); w_list.append(_weight_for(cp))
+        except Exception as e:
+            _log_exception(e, "prompt_chunk_encode")
+            continue
+
+    if not pos_list or not neg_list:
+        _log_event({"event":"prompt_chunking_fallback_nochunks"})
+        return None
+
+    # Weighted average across chunks (preserve original dtype)
+    w = torch.tensor(w_list, dtype=torch.float32, device=pos_list[0].device)
+    w = w / (w.sum() if float(w.sum().item()) > 0 else 1.0)
+
+    def _combine(tensors: List[torch.Tensor]) -> torch.Tensor:
+        dtype = tensors[0].dtype
+        stacked = torch.stack([t.float() for t in tensors], dim=0)  # [chunks,B,seq,dim]
+        w_exp = w.view(-1, *([1] * (stacked.dim() - 1)))
+        out = (stacked * w_exp).sum(dim=0).to(dtype=dtype)
+        return out
+
+    pos_comb = _combine(pos_list)
+    neg_comb = _combine(neg_list)
+
+    _PROMPT_EMBED_CACHE[key] = {"pos": pos_comb, "neg": neg_comb, "ts": time.time()}
+    _PROMPT_CACHE_ORDER.append(key)
+    max_items = int(os.getenv("MAX_PROMPT_CACHE", "64"))
+    if len(_PROMPT_CACHE_ORDER) > max_items:
+        old = _PROMPT_CACHE_ORDER.pop(0)
+        _PROMPT_EMBED_CACHE.pop(old, None)
+
+    _log_event({
+        "event": "prompt_chunking_used",
+        "pos_chunks": len(pos_chunks),
+        "neg_chunks": (len(neg_chunks) if neg_chunks is not None else 1),
+        "token_limit": eff_body
+    })
+    return pos_comb, neg_comb
+
+# --- People/anatomy helpers (place near other helpers) ---
+def _is_people_prompt(text: str) -> bool:
+    t = (text or "").lower()
+    if not t:
+        return False
+    tokens = (
+        "person","people","human","man","woman","boy","girl","male","female",
+        "portrait","face","model","actor","actress","body","full body","selfie","hands","fingers","arm","leg"
+    )
+    return any(tok in t for tok in tokens)
+
+def _augment_anatomy_prompt(prompt: str) -> str:
+    base_aug = os.getenv(
+        "ANATOMY_GUARD_POSITIVE_AUG_TEXT",
+        "one person, full body, 2 arms, 2 legs, 5 fingers per hand, realistic hands, coherent anatomy, symmetrical body"
+    )
+    p = prompt or ""
+    keys = ("2 arms","2 legs","5 fingers","coherent anatomy","realistic hands","symmetrical")
+    if any(k.lower() in p.lower() for k in keys):
+        return p
+    joiner = (", " if p and not p.strip().endswith(",") else "")
+    return f"{p}{joiner}{base_aug}"
+
+def _apply_anatomy_guard(
+    profile: str,
+    sampler: str,
     prompt: str,
     negative: str,
     steps: int,
     cfg: float,
     width: int,
-    height: int,
-    seed: int,
-    batch: int,
-    sampler: str,
-    device: str = "cuda",
-    progress_cb: Optional[Callable[[str], None]] = None,
-    cancel_event: Optional[threading.Event] = None
-) -> List["object"]:
-    pipe = _load_pipeline(device=device, sampler=sampler)
-    def _round8(x: int) -> int: return max(64, (x // 8) * 8)
-    width, height = _round8(width), _round8(height)
-    images = []
-    gen_device = "cuda" if (device == "cuda" and torch.cuda.is_available()) else "cpu"
-    def _callback(step: int, timestep: int, latents):
-        if cancel_event and cancel_event.is_set():
-            raise RuntimeError("cancelled")
-        if progress_cb and steps > 0 and (step == 0 or step == steps - 1 or (step % max(1, steps // 10) == 0)):
-            progress_cb(f"Sampling step {step}/{steps}")
-    for i in range(batch):
-        if cancel_event and cancel_event.is_set(): break
-        g = torch.Generator(device=gen_device).manual_seed(seed + i)
-        with torch.inference_mode():
-            out = pipe(prompt=prompt,
-                       negative_prompt=negative or None,
-                       guidance_scale=cfg,
-                       num_inference_steps=steps,
-                       width=width,
-                       height=height,
-                       generator=g,
-                       callback=_callback,
-                       callback_steps=1)
-        images.append(out.images[0])
-    return images
+    height: int
+) -> Tuple[str, str, int, float, int, int, str, Dict[str, Any]]:
+    """
+    People-aware overrides for better anatomy stability, opt-in via env:
+      ANATOMY_GUARD=1 (default 1), ANATOMY_GUARD_SAMPLER (default dpmpp_2m_karras),
+      ANATOMY_GUARD_GUIDANCE_RESCALE (default 0.7),
+      ANATOMY_GUARD_POSITIVE_AUG (default 1), ANATOMY_GUARD_AUTO_PORTRAIT (default 0),
+      ANATOMY_GUARD_TURBO_CFG_MAX (default 5.5), ANATOMY_GUARD_TURBO_STEPS (default 10).
+    """
+    if os.getenv("ANATOMY_GUARD", "1") != "1":
+        return prompt, negative, steps, cfg, width, height
 
-def generate_video(
-    prompt: str,
-    frames: int = 16,
-    width: int = 512,
-    height: int = 512,
-    seed: int = 0,
-    fps: int = 8,
-    steps: Optional[int] = None,
-    cfg: Optional[float] = None,
-    negative: str = "",
-    progress_cb: Optional[Callable[[str], None]] = None,
-    cancel_event: Optional[threading.Event] = None
-) -> List["object"]:
+    is_people = _is_people_prompt(prompt) or _is_people_prompt(negative)
+    if not is_people:
+        return prompt, negative, steps, cfg, width, height
+
+    changed = False
+    meta: Dict[str, Any] = {"profile": profile, "applied": True}
+
+    if os.getenv("ANATOMY_GUARD_AUTO_PORTRAIT", "0") == "1" and width > height:
+        width, height = height, width
+        changed = True
+        meta["auto_portrait"] = True
+
+    if os.getenv("ANATOMY_GUARD_POSITIVE_AUG", "1") == "1":
+        new_prompt = _augment_anatomy_prompt(prompt)
+        if new_prompt != prompt:
+            prompt = new_prompt
+            changed = True
+            meta["positive_aug"] = True
+
+    want_sampler = os.getenv("ANATOMY_GUARD_SAMPLER", "dpmpp_2m_karras").strip() or sampler
+    if want_sampler and want_sampler.lower() != (sampler or "").lower():
+        sampler = want_sampler
+        changed = True
+        meta["sampler"] = sampler
+
+    if profile == "turbo":
+        cfg_max = float(os.getenv("ANATOMY_GUARD_TURBO_CFG_MAX", "5.5"))
+        if cfg > cfg_max:
+            cfg = cfg_max
+            changed = True
+            meta["cfg_clamped"] = cfg
+        min_steps = int(os.getenv("ANATOMY_GUARD_TURBO_STEPS", "10"))
+        if steps < min_steps:
+            steps = min_steps
+            changed = True
+            meta["steps_bumped"] = steps
+
+    grescale = float(os.getenv("ANATOMY_GUARD_GUIDANCE_RESCALE", "0.7"))
+    meta["guidance_rescale"] = max(0.0, min(1.0, grescale))
+
+    if changed:
+        _log_event({"event": "anatomy_guard_applied", **meta})
+    else:
+        _log_event({"event": "anatomy_guard_detected_people_nochange", **meta})
+    return prompt, negative, steps, cfg, width, height, sampler, meta
+
+# --- Generation toggles / helpers needed by loader and run ---
+def _should_use_bf16(pipe_cls: Any, target: str) -> bool:
+    if os.getenv("ENABLE_BF16", "1") != "1":
+        return False
+    if not torch.cuda.is_available():
+        return False
+    supported = False
     try:
-        from src.nodes.cosmos_backend import generate_frames as cosmos_frames
-        return cosmos_frames(prompt, frames, width, height,
-                             seed, fps, progress_cb,
-                             cancel_event=cancel_event,
-                             steps=steps, cfg=cfg, negative=negative)
+        supported = bool(getattr(torch.cuda, "is_bf16_supported", lambda: False)())
+    except Exception:
+        pass
+    if not supported:
+        try:
+            major, _ = torch.cuda.get_device_capability()
+            supported = (major >= 8)  # Ampere/Ada+
+        except Exception:
+            supported = False
+    if not supported:
+        _log_event({"event": "bf16_skip", "reason": "unsupported_device"})
+        return False
+    if "turbo" in (target or "").lower():
+        _log_event({"event": "bf16_skip", "reason": "turbo_target"})
+        return False
+    return True
+
+def _profile_for_target(path: str) -> str:
+    p = (path or "").lower()
+    if "turbo" in p:
+        return "turbo"
+    if "refiner" in p:
+        return "refiner"
+    if "xl" in p:
+        return "sdxl"
+    return "sd1"
+
+def _adapt_steps(user_steps: int, profile: str, use_refiner: bool) -> int:
+    # Turbo benefits from very low steps; SDXL/SD1 follow requested steps
+    if profile == "turbo":
+        cap = int(os.getenv("TURBO_STEPS_CAP", "8"))
+        return min(user_steps, cap)
+    return user_steps
+
+# Ensure generation run counter exists
+try:
+    _GENERATION_RUN_COUNTER  # noqa: F821
+except NameError:
+    _GENERATION_RUN_COUNTER = 0
+
+def _set_vae_slicing_for_shape(pipe, width: int, height: int, profile: str):
+    """
+    Enable/disable VAE slicing dynamically based on resolution to avoid slow decodes.
+    Safe no-op if methods not present. Turbo keeps slicing disabled for speed.
+    """
+    try:
+        vae = getattr(pipe, "vae", None)
+        if not vae:
+            return
+        if profile == "turbo":
+            return
+        pixels = max(1, int(width) * int(height))
+        px_thr = int(os.getenv("VAE_SLICING_PX_THRESHOLD", "1105920"))  # ~1080p
+        if pixels >= px_thr:
+            if hasattr(vae, "enable_slicing"):
+                vae.enable_slicing()
+        else:
+            if hasattr(vae, "disable_slicing"):
+                vae.disable_slicing()
     except Exception as e:
-        if progress_cb: progress_cb(f"Video backend fatal: {e}")
-        from PIL import Image
-        return [Image.new("RGB",(width,height),(0,0,0)) for _ in range(frames)]
+        _log_exception(e, "set_vae_slicing_for_shape")
 
-def pil_to_qimage(pil_img):
-    from PIL import Image  # noqa
-    from PySide6 import QtGui  # type: ignore
-    if pil_img.mode not in ("RGB","RGBA"):
-        pil_img = pil_img.convert("RGBA")
-    data = pil_img.tobytes("raw", pil_img.mode)
-    fmt = QtGui.QImage.Format.Format_RGBA8888 if pil_img.mode == "RGBA" else QtGui.QImage.Format.Format_RGB888
-    return QtGui.QImage(data, pil_img.width, pil_img.height, fmt).copy()
-
-# Optional: expose prefetch trigger
-def trigger_background_prefetch():
+def _recover_black_pipeline_image(pipe, prompt: str, negative: str, gen_kwargs: dict, profile: str):
+    """
+    Fallback when pipeline returns empty images (rare). Re-run once to latent and decode.
+    Returns PIL.Image or None.
+    """
     try:
-        start_prefetch()
+        if profile != "sdxl":
+            return None
+        args = dict(gen_kwargs)
+        args.pop("prompt_embeds", None)
+        args.pop("negative_prompt_embeds", None)
+        args.update(prompt=prompt, negative_prompt=negative or None, output_type="latent")
+        out = pipe(**args)
+        latents = getattr(out, "latents", None) or getattr(out, "images", None)
+        if latents is None:
+            return None
+        img, std_val = _sdxl_pipeline_decode(pipe, latents)
+        if img is not None and std_val >= 0.0008:
+            return img
+        imgs = _sdxl_manual_decode_batch(pipe, latents, force_fp32=False)
+        return imgs[0] if imgs else None
+    except Exception as e:
+        _log_exception(e, "recover_black_pipeline_image")
+        return None
+
+# --- Main generation entry point (called by UI) ---
+def generate_images(
+    prompt:str,
+    negative:str,
+    steps:int,
+    cfg:float,
+    width:int,
+    height:int,
+    seed:int,
+    batch:int,
+    sampler:str,
+    device:str="cuda",
+    progress_cb:Optional[Callable[[str],None]]=None,
+    cancel_event:Optional[threading.Event]=None,
+    _internal_retry:bool=False
+)->List[Any]:
+    manual_decode = (os.getenv("MANUAL_DECODE","1")!="0")
+    t_start=time.time()
+    tgt = current_model_target()
+    if tgt:
+        ok, issues = validate_local_model(tgt)
+        print(f"[DEBUG] Model validation: ok={ok}, issues={issues}")
+    pipe=_load_pipeline(device=device, sampler=sampler)
+
+    global _GENERATION_RUN_COUNTER
+    _GENERATION_RUN_COUNTER += 1
+    run_id=_GENERATION_RUN_COUNTER
+    _log_event({"event":"generation_run_start","run_id":run_id,"target":current_model_target()})
+
+    try:
+        _log_event({"event":"anomaly_rerun_counter_init",
+                    "value": int(os.getenv("_ANOMALY_RERUNS_DONE","0"))})
     except Exception:
         pass
 
-# -------- Runtime toggles --------
-def set_disk_cache_enabled(enabled: bool):
-    global _DISK_CACHE_ENABLED
-    _DISK_CACHE_ENABLED = bool(enabled)
-    _log_event({"event":"pipeline_cache_toggle","enabled":_DISK_CACHE_ENABLED})
+    prompt=prompt.strip()
+    negative=(negative or "").strip()
 
-def is_disk_cache_enabled() -> bool:
-    return _DISK_CACHE_ENABLED
+    profile=_profile_for_target(current_model_target() or "")
+    if profile=="turbo":
+        manual_decode = True
+        _log_event({"event":"manual_decode_forced","reason":"turbo_no_images"})
 
-# -------- VRAM / pipeline release --------
-def release_pipeline(free_ram: bool = False):
-    global _PIPELINE, _PIPELINE_MODEL_ID, _DEVICE
-    with _LOCK:
-        if _PIPELINE is not None:
+    if profile=="turbo" and manual_decode and os.getenv("MANUAL_DECODE_SKIP_TURBO","0")=="1":
+        manual_decode=False
+        _log_event({"event":"manual_decode_skipped","reason":"turbo_forced"})
+    if profile=="sdxl" and manual_decode and os.getenv("DISABLE_SDXL_MANUAL_DECODE","1")=="1":
+        manual_decode=False
+        _log_event({"event":"manual_decode_disabled","reason":"sdxl_default"})
+    if (profile=="sd1" and os.getenv("SDXL_STRICT","0")=="1"
+        and any(tag in prompt.lower() for tag in ("sdxl","xl-base","8k","photoreal anime"))):
+        _log_event({"event":"profile_mismatch_abort","profile":profile,"len":len(prompt)})
+        raise RuntimeError("Prompt appears tailored for SDXL but SD1 model is active. Switch to SDXL or disable SDXL_STRICT.")
+
+    use_refiner_env=os.getenv("USE_REFINER","0")=="1"
+    adapt_env = os.getenv("ADAPT_STEPS","0")=="1" or (profile=="turbo" and os.getenv("ADAPT_STEPS") is None)
+    orig_steps=steps
+    if adapt_env:
+        steps=_adapt_steps(steps, profile, use_refiner_env)
+        if steps!=orig_steps: _log_event({"event":"steps_adapted","from":orig_steps,"to":steps,"profile":profile})
+
+    # Anatomy Guard: may alter prompt/negative/steps/cfg/sampler/size.
+    anat_meta: Dict[str, Any] = {}
+    cache_invalidate = False
+    try:
+        prompt2, negative2, steps2, cfg2, width2, height2, sampler2, anat_meta = _apply_anatomy_guard(
+            profile, sampler, prompt, negative, steps, cfg, width, height
+        )
+        if sampler2 != sampler:
+            _apply_scheduler(pipe, sampler2)
+            sampler = sampler2
+        cache_invalidate = (prompt2 != prompt) or (negative2 != negative) or (cfg2 != cfg)
+        prompt, negative, steps, cfg, width, height = prompt2, negative2, steps2, cfg2, width2, height2
+    except Exception as e:
+        _log_exception(e, "anatomy_guard_apply")
+
+    is_sdxl=("xl" in (current_model_target() or "").lower())
+
+    base_gen=torch.Generator(device=device if (device=="cuda" and torch.cuda.is_available()) else "cpu")
+    if seed!=0: base_gen.manual_seed(seed)
+
+    cached_embeds=None
+    if batch==1:
+        disable_first = (os.getenv("PROMPT_CACHE_DISABLE_FIRST_RUN","0")=="1"
+                         and run_id==1 and len(_PROMPT_CACHE_ORDER)==0)
+        if not disable_first:
+            cached_embeds=_get_prompt_embeds(pipe, prompt, negative, cfg, width, height, device)
+        else:
+            _log_event({"event":"prompt_cache_first_run_skip"})
+
+    images: List[Any]=[]
+    step_durations=[]
+
+    with torch.inference_mode():
+        for b in range(batch):
+            if cancel_event and cancel_event.is_set(): raise RuntimeError("cancelled")
+            _set_vae_slicing_for_shape(pipe, width, height, profile)
+
+            g=base_gen
+            if seed!=0 and batch>1:
+                g=torch.Generator(device=device if (device=="cuda" and torch.cuda.is_available()) else "cpu")
+                g.manual_seed(seed+b)
+            if progress_cb and b>0: progress_cb(f"Batch {b+1}/{batch}")
+            cb=None
+            gen_kwargs=dict(num_inference_steps=steps,guidance_scale=cfg,width=width,height=height,
+                            generator=g,callback=cb,callback_steps=1)
             try:
-                if free_ram:
-                    _PIPELINE.to("cpu")
-                    torch.cuda.empty_cache()
-                _PIPELINE = None
-                _PIPELINE_MODEL_ID = None
-                _DEVICE = None
+                gres = float(anat_meta.get("guidance_rescale", 0.0)) if isinstance(anat_meta, dict) else 0.0
+                if gres > 0.0:
+                    gen_kwargs["guidance_rescale"] = gres
+            except Exception:
+                pass
+            gen_kwargs["output_type"] = "latent" if profile=="turbo" else "pil"
+            if cached_embeds and batch==1:
+                pos,neg_emb=cached_embeds
+                gen_kwargs.update(prompt_embeds=pos, negative_prompt_embeds=neg_emb)
+            else:
+                gen_kwargs.update(prompt=prompt, negative_prompt=negative or None)
+            t_pipe_call = time.time()
+            out = None
+            try:
+                out = pipe(**gen_kwargs)
             except Exception as e:
-                print(f"[Generation] Pipeline release failed: {e}", flush=True)
-                _log_event({"event":"pipeline_release_error","message":str(e)})
-        
-# -------- Cache diagnostics / purge --------
+                print(f"[ERROR] Pipeline call failed: {e}")
+            pipe_ms = int((time.time() - t_pipe_call) * 1000)
+            _log_event({"event":"diffusion_call_ms","ms":pipe_ms})
+
+            if profile=="turbo" and out is not None:
+                latents = getattr(out, "latents", None) or getattr(out, "images", None)
+                if latents is not None:
+                    t_dec = time.time()
+                    imgs = _sdxl_manual_decode_batch(pipe, latents, force_fp32=False)
+                    dec_ms = int((time.time() - t_dec) * 1000)
+                    _log_event({"event": "manual_decode_ms", "ms": dec_ms, "count": len(imgs)})
+                    images.extend(imgs)
+            elif out is not None:
+                imgs = getattr(out, 'images', [])
+                if (not imgs) and profile == "sdxl":
+                    fb = _recover_black_pipeline_image(pipe, prompt, negative, gen_kwargs, profile)
+                    if fb is not None:
+                        imgs = [fb]
+                        _log_event({"event":"sdxl_pipeline_empty_fallback_used"})
+                images.extend(imgs)
+
+    sampling_ms = int(sum(step_durations) * 1000)
+    total_ms = int((time.time() - t_start) * 1000)
+    brightness_list = []
+    try:
+        import numpy as np
+        for im in images:
+            brightness_list.append(float(np.asarray(im).mean() / 255.0))
+    except Exception:
+        pass
+
+    _log_event({"event":"decode_overhead","sampling_ms":sampling_ms,"decode_ms":0,
+                 "total_ms":total_ms,"manual":profile=="turbo","run_id":run_id})
+    _vram_snapshot("post_generation", {"count":len(images),"w":width,"h":height,"steps":steps})
+    _log_event({"event":"generation_summary","count":len(images),"steps":steps,"cfg":cfg,
+                "w":width,"h":height,"sampler":sampler,"total_ms":total_ms,
+                "brightness":brightness_list,"run_id":run_id})
+
+    if FREE_VRAM_AFTER_GEN:
+        release_pipeline(free_ram=False)
+    if os.getenv("_ANOMALY_RERUNS_DONE"):
+        os.environ["_ANOMALY_RERUNS_DONE"]="0"
+    return images
+
+def pil_to_qimage(pil_img):
+    """
+    Convert a PIL.Image to QImage using PySide6 or PyQt5.
+    Raises ImportError if Qt bindings are unavailable.
+    """
+    try:
+        from PySide6 import QtGui  # type: ignore
+    except Exception:
+        try:
+            from PyQt5 import QtGui  # type: ignore
+        except Exception as e:
+            # Let caller handle; MainWindow suppresses and will show "No images generated."
+            raise e
+    try:
+        from PIL import Image  # noqa: F401
+        if pil_img.mode not in ("RGB", "RGBA"):
+            pil_img = pil_img.convert("RGBA")
+        data = pil_img.tobytes("raw", pil_img.mode)
+        fmt = (QtGui.QImage.Format.Format_RGBA8888
+               if pil_img.mode == "RGBA" else QtGui.QImage.Format.Format_RGB888)
+        return QtGui.QImage(data, pil_img.width, pil_img.height, fmt).copy()
+    except Exception as e:
+        # Propagate so the caller's suppress(Exception) keeps qimg_list clean
+        raise e
+
+def has_pipeline() -> bool:
+    return _PIPELINE is not None
+
 def disk_cache_root() -> str:
     return str(PIPELINE_DISK_CACHE_DIR)
-
-def _entry_info(p: Path) -> dict:
-    try:
-        return {
-            "slug": p.name,
-            "files": sum(1 for _f in p.rglob("*") if _f.is_file()),
-            "mb": round(_dir_size(p) / (1024*1024), 2),
-            "age_s": int(time.time() - p.stat().st_mtime)
-        }
-    except Exception:
-        return {"slug": p.name}
-
-def get_cache_stats() -> dict:
-    ents = _disk_cache_entries()
-    info = [_entry_info(e) for e in ents]
-    total_bytes = sum(_dir_size(e) for e in ents)
-    data = {
-        "root": disk_cache_root(),
-        "enabled": _DISK_CACHE_ENABLED,
-        "entries": info,
-        "total_mb": round(total_bytes / (1024*1024), 2),
-        "count": len(info)
-    }
-    _log_event({"event":"disk_cache_stats","count":data["count"],"total_mb":data["total_mb"]})
-    return data
-
-def purge_disk_cache():
-    ents = _disk_cache_entries()
-    freed = 0
-    for e in ents:
-        try:
-            sz = _dir_size(e)
-            shutil.rmtree(e, ignore_errors=True)
-            freed += sz
-        except Exception:
-            pass
-    map_file = PIPELINE_DISK_CACHE_DIR / "mapping.json"
-    if map_file.exists():
-        try: map_file.unlink()
-        except Exception: pass
-    _log_event({"event":"disk_cache_purge","freed_mb":round(freed/(1024*1024),2)})
-    print(f"[Generation] Disk cache purged, freed ~{freed/(1024*1024):.2f} MB", flush=True)

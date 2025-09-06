@@ -1,268 +1,264 @@
 """
-Refiner subsystem — robust, single-definition version.
-No future imports (removed to avoid SyntaxError triggered by hidden BOM / cache).
+SDXL Refiner module (latent handoff + optional RGB fallback)
+
+Usage (latent path – higher fidelity):
+  base_out = base_pipe(
+      prompt=..., negative_prompt=..., num_inference_steps=BASE_STEPS,
+      guidance_scale=CFG, width=W, height=H,
+      output_type="latent", denoising_end=SPLIT)
+  latents = base_out.images[0]  # (B,C,H,W)
+  refined = refine_from_latents(latents, prompt, negative_prompt, guidance_scale=CFG)
+
+Fallback (RGB) if latents unavailable:
+  refined_img = refine_image_from_rgb(pil_image, prompt, negative_prompt)
+
+Environment variables:
+  SDXL_REFINER_PATH        Path to refiner weights (default: <repo>/models/.../sdxl-refiner-1.0)
+  SDXL_REFINER_SPLIT       Default split (denoising start) for latent refine (default 0.8)
+  SDXL_REFINER_STEPS       Refiner steps (default 6)
+  SDXL_REFINER_VARIANT     'fp16' / 'fp32' / etc. (default fp16)
+  SDXL_REFINER_XFORMERS=1  Enable memory‑efficient attention if available (default 1)
+  SDXL_REFINER_STRENGTH    RGB fallback strength (default 0.35)
+  SDXL_REFINER_ASYNC=1     Allow background async loading (default 1)
 """
-import os, sys, json, threading, traceback, time
+
+from __future__ import annotations
+import os, json, time, threading, traceback
 from datetime import datetime
-from typing import Optional, Any, Dict
-
-from PIL import Image
+from typing import Optional, Any, Dict, Tuple
 import torch
-
-REFINER_PATH = "F:/SoftwareDevelopment/AI Models Image/AIGenerator/models/text_to_image/sdxl-refiner-1.0"
-SAVE_PATH = "F:/SoftwareDevelopment/AI Models Image/AIGenerator/output/refined"
-PROMPT = "cockpit-grade GUI with tactical overlays"
-
-_TELEMETRY_LOG = os.path.join(
-    "F:/SoftwareDevelopment/AI Models Image/AIGenerator/outputs",
-    "logs", "telemetry_logs", "telemetry.jsonl"
-)
+from PIL import Image
 
 try:
-    from diffusers import StableDiffusionXLImg2ImgPipeline  # type: ignore
-    REFINER_IMPORTABLE = True
+    from diffusers import StableDiffusionXLRefinerPipeline  # type: ignore
+    _IMPORTABLE = True
 except Exception:
-    StableDiffusionXLImg2ImgPipeline = None  # type: ignore
-    REFINER_IMPORTABLE = False
+    StableDiffusionXLRefinerPipeline = None  # type: ignore
+    _IMPORTABLE = False
 
-REFINER_AVAILABLE = os.path.isdir(REFINER_PATH) and REFINER_IMPORTABLE
+# ---------- Paths / Config ----------
+_REPO_DEFAULT = "F:/SoftwareDevelopment/AI Models Image/AIGenerator/models/text_to_image/stable-diffusion-xl-refiner-1.0"
+REFINER_PATH = os.environ.get("SDXL_REFINER_PATH", _REPO_DEFAULT)
+_SPLIT_DEF = float(os.environ.get("SDXL_REFINER_SPLIT", "0.8"))
+_STEPS_DEF = int(os.environ.get("SDXL_REFINER_STEPS", "6"))
+_STRENGTH_DEF = float(os.environ.get("SDXL_REFINER_STRENGTH", "0.35"))
+_ASYNC = os.environ.get("SDXL_REFINER_ASYNC", "1") == "1"
 
-_refiner_lock = threading.RLock()
-_refiner_pipe: Optional[Any] = None
-_refiner_device: Optional[str] = None
+# ---------- Telemetry helpers ----------
+def _now(): return datetime.utcnow().isoformat()
 
-def _safe_write_jsonl(path: str, payload: Dict[str, Any]) -> None:
+def _fallback_telemetry(rec: Dict[str, Any]):
+    # Local file fallback if telemetry module absent
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+        log_root = os.path.join("logs")
+        os.makedirs(log_root, exist_ok=True)
+        with open(os.path.join(log_root, "refiner_fallback.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
         pass
 
-def log_event(event: Any) -> None:
-    if isinstance(event, dict):
-        payload = event.copy()
-        payload.setdefault("timestamp", datetime.now().isoformat())
-    else:
-        payload = {"message": str(event), "timestamp": datetime.now().isoformat()}
-    _safe_write_jsonl(_TELEMETRY_LOG, payload)
+try:
+    from src.modules.utils.telemetry import log_event as _log_event, log_exception as _log_exception
+except Exception:
+    def _log_event(d: Dict[str, Any]): _fallback_telemetry(d)
+    def _log_exception(e: Exception, context: str = ""):
+        _fallback_telemetry({"event":"exception","ctx":context,"err":str(e),"trace":traceback.format_exc(),"ts":_now()})
 
-def log_telemetry(**kw):
-    kw.setdefault("timestamp", datetime.now().isoformat())
-    log_event(kw)
+def _log(event: str, **kw):
+    kw.update(event=event, ts=_now())
+    _log_event(kw)
 
-def log_memory(device: str):
+# ---------- Internal State ----------
+_lock = threading.RLock()
+_pipe: Optional[Any] = None
+_device: Optional[str] = None
+_dtype: Optional[torch.dtype] = None
+_async_thread: Optional[threading.Thread] = None
+
+# ---------- Core Helpers ----------
+def available() -> bool:
+    return _IMPORTABLE and os.path.isdir(REFINER_PATH)
+
+def has_refiner() -> bool:
+    return _pipe is not None or available()
+
+def _choose_device() -> Tuple[str, torch.dtype]:
+    if torch.cuda.is_available():
+        return "cuda", torch.float16
+    return "cpu", torch.float32
+
+def _enable_xformers(pipe):
+    if os.environ.get("SDXL_REFINER_XFORMERS","1") != "1": return
     try:
-        if device == "cuda" and torch.cuda.is_available():
-            mb = torch.cuda.memory_allocated() / 1024**2
-            log_event({"event": "RefinerMemory", "device": device, "allocated_mb": round(mb, 2)})
-    except Exception:
-        pass
-
-def _serialize_config(pipe) -> Dict[str, Any]:
-    try:
-        cfg = getattr(pipe, "config", None)
-        if cfg is None:
-            return {"config": None}
-        try:
-            return dict(cfg)
-        except Exception:
-            import json as _json
-            try:
-                return _json.loads(_json.dumps(cfg, default=str))
-            except Exception:
-                return {"config_str": str(cfg)}
-    except Exception:
-        return {"config_error": "failed to serialize config"}
-
-def load_refiner(device: str = "cuda", force_reload: bool = False):
-    global _refiner_pipe, _refiner_device
-    if device == "cuda" and not torch.cuda.is_available():
-        device = "cpu"
-    if not REFINER_AVAILABLE:
-        if _refiner_pipe is None:
-            _refiner_pipe = object()
-            _refiner_device = "stub"
-        return _refiner_pipe
-    with _refiner_lock:
-        if _refiner_pipe is not None and not force_reload and _refiner_device == device:
-            return _refiner_pipe
-        try:
-            print("[Refiner] Loading img2img model...", flush=True)
-            pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
-                REFINER_PATH,
-                torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-                variant="fp16",
-                use_safetensors=True
-            ).to(device)
-            _refiner_pipe = pipe
-            _refiner_device = device
-            log_event({"event": "RefinerLoad", "status": "success",
-                       "device": device, "path": REFINER_PATH,
-                       "config": _serialize_config(pipe)})
-            print("[Refiner] Ready.", flush=True)
-            return _refiner_pipe
-        except Exception as e:
-            log_event({"event": "RefinerLoadFailed", "device": device, "error": str(e),
-                       "trace": traceback.format_exc()})
-            print(f"[Refiner] Load failed on {device}: {e}", flush=True)
-            if device != "cpu":
-                try:
-                    print("[Refiner] Retrying on CPU...", flush=True)
-                    pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
-                        REFINER_PATH,
-                        torch_dtype=torch.float32,
-                        variant="fp16",
-                        use_safetensors=True
-                    ).to("cpu")
-                    _refiner_pipe = pipe
-                    _refiner_device = "cpu"
-                    log_event({"event": "RefinerLoad", "status": "cpu_fallback",
-                               "path": REFINER_PATH})
-                    print("[Refiner] CPU fallback ready.", flush=True)
-                    return _refiner_pipe
-                except Exception as e2:
-                    log_event({"event": "RefinerLoadFailedCPU",
-                               "error": str(e2),
-                               "trace": traceback.format_exc()})
-            _refiner_pipe = object()
-            _refiner_device = "stub"
-            return _refiner_pipe
-
-def log_model_config(pipe) -> None:
-    try:
-        snap = _serialize_config(pipe)
-        os.makedirs(SAVE_PATH, exist_ok=True)
-        path = os.path.join(SAVE_PATH, "refiner_config.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(snap, f, indent=2, ensure_ascii=False, default=str)
-        log_event({"event": "RefinerConfigSaved", "path": path})
+        if hasattr(pipe, "enable_xformers_memory_efficient_attention"):
+            pipe.enable_xformers_memory_efficient_attention()
+            _log("refiner_xformers_enabled")
     except Exception as e:
-        log_event({"event": "RefinerConfigWriteError", "error": str(e),
-                   "trace": traceback.format_exc()})
+        _log_exception(e, "refiner_xformers")
 
-def get_refiner_status() -> Dict[str, Any]:
+# ---------- Load ----------
+def load_refiner(force: bool = False):
+    global _pipe, _device, _dtype
+    if not available():
+        _log("refiner_unavailable", path=REFINER_PATH, importable=_IMPORTABLE)
+        return None
+    with _lock:
+        if _pipe is not None and not force:
+            return _pipe
+        dev, dt = _choose_device()
+        variant = os.environ.get("SDXL_REFINER_VARIANT", "fp16")
+        t0 = time.time()
+        try:
+            pipe = StableDiffusionXLRefinerPipeline.from_pretrained(
+                REFINER_PATH,
+                torch_dtype=dt,
+                use_safetensors=True,
+                safety_checker=None,
+                variant=variant
+            )
+            if dev == "cuda":
+                pipe.to(dev)
+            _enable_xformers(pipe)
+            _pipe = pipe
+            _device = dev
+            _dtype = dt
+            _log("refiner_load", device=dev, variant=variant,
+                 ms=int((time.time()-t0)*1000))
+            return _pipe
+        except Exception as e:
+            _log_exception(e, "refiner_load")
+            _pipe = None
+            return None
+
+def _async_loader():
+    try:
+        load_refiner()
+    except Exception as e:
+        _log_exception(e, "refiner_async")
+
+def ensure_loaded_async():
+    global _async_thread
+    if not _ASYNC or _pipe is not None:
+        return
+    if _async_thread and _async_thread.is_alive():
+        return
+    _async_thread = threading.Thread(target=_async_loader, daemon=True)
+    _async_thread.start()
+    _log("refiner_async_start")
+
+# ---------- Refinement (Latent) ----------
+def refine_from_latents(
+    latents: torch.Tensor,
+    prompt: str,
+    negative_prompt: Optional[str],
+    guidance_scale: float = 5.0,
+    split: Optional[float] = None,
+    steps: Optional[int] = None
+):
+    pipe = load_refiner()
+    if pipe is None:
+        _log("refiner_latent_no_pipe")
+        return None
+    if latents is None or not torch.is_tensor(latents):
+        _log("refiner_latent_invalid")
+        return None
+    if latents.dim() != 4:
+        _log("refiner_latent_badshape", shape=list(latents.shape))
+        return None
+    use_split = split if split is not None else _SPLIT_DEF
+    use_split = min(max(use_split, 0.5), 0.95)
+    use_steps = steps if steps is not None else _STEPS_DEF
+    use_steps = max(1, use_steps)
+    t0 = time.time()
+    try:
+        out = pipe(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            num_inference_steps=use_steps,
+            denoising_start=use_split,
+            guidance_scale=guidance_scale,
+            latents=latents
+        )
+        img = out.images[0]
+        _log("refiner_latent_ok", split=use_split, steps=use_steps,
+             ms=int((time.time()-t0)*1000), guidance=guidance_scale)
+        return img
+    except Exception as e:
+        _log_exception(e, "refiner_latent")
+        return None
+
+# ---------- RGB Fallback ----------
+def refine_image_from_rgb(
+    image: Image.Image,
+    prompt: str,
+    negative_prompt: Optional[str] = None,
+    steps: int = 10,
+    strength: float = 0.3
+):
+    pipe = load_refiner()
+    if pipe is None:
+        _log("refiner_rgb_no_pipe")
+        return image
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+    t0 = time.time()
+    try:
+        out = pipe(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            image=image,
+            strength=strength,
+            num_inference_steps=steps
+        )
+        res = out.images[0]
+        _log("refiner_rgb_ok", steps=steps, strength=strength,
+             ms=int((time.time()-t0)*1000))
+        return res
+    except Exception as e:
+        _log_exception(e, "refiner_rgb")
+        return image
+
+# ---------- Back-compat UI Wrapper ----------
+def refine_image(image, prompt=None, negative=None, **kw):
+    """
+    Returns dict: {"image": PIL.Image or None}
+    """
+    try:
+        out_img = refine_image_from_rgb(
+            image,
+            prompt=prompt or "",
+            negative_prompt=negative,
+            steps=int(os.getenv("SDXL_REFINER_STEPS", str(_STEPS_DEF))),
+            strength=float(os.getenv("SDXL_REFINER_STRENGTH", str(_STRENGTH_DEF)))
+        )
+        return {"image": out_img}
+    except Exception as e:
+        _log_exception(e, "refine_image_wrapper")
+        return {"image": None, "error": str(e)}
+
+# ---------- Status ----------
+def status() -> Dict[str, Any]:
     return {
-        "available": REFINER_AVAILABLE,
-        "device": "cuda" if torch.cuda.is_available() else "cpu",
+        "available": available(),
+        "loaded": _pipe is not None,
+        "device": _device,
+        "dtype": str(_dtype),
         "path": REFINER_PATH,
-        "importable": REFINER_IMPORTABLE,
-        "timestamp": datetime.now().isoformat()
+        "importable": _IMPORTABLE,
+        "ts": _now()
     }
 
-def refine_image(
-    base_image: Image.Image,
-    prompt: str = PROMPT,
-    negative: Optional[str] = None,
-    width: Optional[int] = None,
-    height: Optional[int] = None,
-    strength: float = 0.3,
-    save: bool = True,
-    save_path: str = SAVE_PATH,
-    filename: Optional[str] = None,
-    device: str = "cuda",
-    fail_silent: bool = True
-):
-    if filename is None:
-        filename = f"refined_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-    # Accept either PIL.Image or QImage (convert if needed)
-    try:
-        from PySide6 import QtGui  # type: ignore
-        if isinstance(base_image, QtGui.QImage):
-            base_image = _qimage_to_pil(base_image)
-    except Exception:
-        pass
+def get_refiner_status() -> Dict[str, Any]:
+    return status()
 
-    if not isinstance(base_image, Image.Image):
-        # Last fallback: cannot refine
-        log_event({"event": "RefinerInputTypeUnsupported", "type": str(type(base_image))})
-        return {"image": None, "path": None, "prompt": prompt,
-                "device": "stub", "duration": 0.0, "filename": filename,
-                "error": "Unsupported image type"}
-
-    if base_image.mode != "RGB":
-        base_image = base_image.convert("RGB")
-
-    try:
-        pipe = load_refiner(device=device, force_reload=False)
-    except Exception as e:
-        if not fail_silent: raise
-        return {"image": base_image, "path": None, "prompt": prompt,
-                "device": "stub", "duration": 0.0, "filename": filename,
-                "error": str(e)}
-
-    if not REFINER_AVAILABLE or _refiner_device == "stub" or not isinstance(pipe, StableDiffusionXLImg2ImgPipeline):
-        out_file = None
-        if save:
-            try:
-                os.makedirs(save_path, exist_ok=True)
-                out_file = os.path.join(save_path, filename)
-                base_image.save(out_file)
-            except Exception:
-                out_file = None
-        log_telemetry(event="RefinerFallback", prompt=prompt, device="stub",
-                      filename=filename, saved=bool(out_file))
-        return {"image": base_image, "path": out_file, "prompt": prompt,
-                "device": "stub", "duration": 0.0, "filename": filename}
-
-    start = time.time()
-    resized = base_image
-    if width and height:
-        resized = base_image.resize((width, height), Image.LANCZOS)
-        log_event({"event": "RefinerResize", "requested": (width, height),
-                   "resized_to": resized.size})
-    try:
-        out = pipe(prompt=prompt, image=resized, strength=strength,
-                   num_inference_steps=20, negative_prompt=negative)
-        refined = out.images[0]
-    except Exception as e:
-        log_event({"event": "RefinerError", "error": str(e),
-                   "trace": traceback.format_exc()})
-        if not fail_silent: raise
-        return {"image": base_image, "path": None, "prompt": prompt,
-                "device": _refiner_device or "cuda", "duration": 0.0,
-                "filename": filename, "error": str(e)}
-
-    duration = round(time.time() - start, 2)
-    log_memory(device)
-
-    out_file = None
-    if save:
-        try:
-            os.makedirs(save_path, exist_ok=True)
-            out_file = os.path.join(save_path, filename)
-            refined.save(out_file)
-        except Exception as e:
-            log_event({"event": "RefinerSaveFailed", "error": str(e),
-                       "trace": traceback.format_exc()})
-            out_file = None
-
-    log_telemetry(event="Refiner", duration=duration, prompt=prompt,
-                  device=_refiner_device, filename=filename,
-                  output_size=getattr(refined, "size", None),
-                  path=out_file, saved=bool(out_file))
-
-    return {"image": refined, "path": out_file, "prompt": prompt,
-            "device": _refiner_device, "duration": duration,
-            "filename": filename}
-
-# -------- Helpers (added) --------
-def _qimage_to_pil(qimg):
-    """
-    Convert a QtGui.QImage to a PIL.Image (RGB).
-    """
-    try:
-        from PySide6 import QtGui  # type: ignore
-        if qimg.format() != QtGui.QImage.Format.Format_RGBA8888:
-            qimg = qimg.convertToFormat(QtGui.QImage.Format.Format_RGBA8888)
-        width, height = qimg.width(), qimg.height()
-        ptr = qimg.bits()
-        ptr.setsize(qimg.byteCount())
-        buf = bytes(ptr)
-        img = Image.frombuffer("RGBA", (width, height), buf, "raw", "RGBA", 0, 1)
-        return img.convert("RGB")
-    except Exception:
-        raise
-
-__all__ = ["load_refiner", "refine_image", "get_refiner_status",
-           "log_event", "log_telemetry"]
+__all__ = [
+    "available",
+    "has_refiner",
+    "ensure_loaded_async",
+    "load_refiner",
+    "refine_from_latents",
+    "refine_image_from_rgb",
+    "refine_image",
+    "status",
+    "get_refiner_status"
+]

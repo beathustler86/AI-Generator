@@ -188,6 +188,28 @@ def _build_central(win, services: Services) -> None:
     form.addRow("Seeds:", seed_row)
     form.addRow("Video:", video_row_container)
 
+    # --- Upscaler row ---
+    upscaler_row = _hbox([])
+    upscaler_label = QtW.QLabel("Upscaler:")
+    upscaler_combo = QtW.QComboBox()
+    upscaler_combo.setMinimumWidth(220)
+    win._ui["upscaler_combo"] = upscaler_combo
+    upscaler_combo.addItem("None")
+    btn_upscale = QtW.QPushButton("Upscale")
+    btn_upscale.setEnabled(False)
+    win._ui["btn_upscale"] = btn_upscale
+
+    # --- Upload Image button ---
+    btn_upload = QtW.QPushButton("Upload Image")
+    win._ui["btn_upload"] = btn_upload
+
+    upscaler_row.addWidget(upscaler_label)
+    upscaler_row.addWidget(upscaler_combo)
+    upscaler_row.addWidget(btn_upscale)
+    upscaler_row.addWidget(btn_upload)
+    upscaler_row.addStretch(1)
+    layout.addLayout(upscaler_row)
+
     layout.addLayout(form)
 
     win._ui["preview_label"] = QtW.QLabel("Preview")
@@ -202,6 +224,15 @@ def _build_central(win, services: Services) -> None:
     win._ui["btn_refine"] = QtW.QPushButton("Refine"); win._ui["btn_refine"].setEnabled(False)
     btn_row.addWidget(win._ui["btn_cancel"])
     btn_row.addWidget(win._ui["btn_refine"])
+
+    # Anatomy Guard controls (additive, safe)
+    anat_chk = QtW.QCheckBox("Anatomy Guard")
+    anat_chk.setChecked(True)
+    win._ui["anatomy_guard_chk"] = anat_chk
+    btn_apply_anat = QtW.QPushButton("Apply Anatomy Guard")
+    win._ui["btn_apply_anatomy_guard"] = btn_apply_anat
+    btn_row.addWidget(anat_chk)
+    btn_row.addWidget(btn_apply_anat)
 
     # Auto refine checkbox
     auto_refine_chk = QtW.QCheckBox("Auto refine")
@@ -221,22 +252,60 @@ def _build_central(win, services: Services) -> None:
     win._ui["auto_gallery_chk"] = auto_gallery_chk
     btn_row.addWidget(auto_gallery_chk)
 
+    precision_label = QtW.QLabel("Precision:")
+    layout.addWidget(precision_label)
+
+    precision_combo = QtW.QComboBox()
+    precision_combo.addItems(["FP16", "FP32"])
+    precision_combo.setCurrentIndex(1)  # Default to FP32
+    layout.addWidget(precision_combo)
+    win._ui["precision_dropdown"] = precision_combo
+
+    # New: Turbo decode precision
+    turbo_dec_label = QtW.QLabel("Turbo Decode:")
+    layout.addWidget(turbo_dec_label)
+
+    turbo_decode_combo = QtW.QComboBox()
+    turbo_decode_combo.addItems(["FP16", "FP32"])
+    turbo_decode_combo.setCurrentIndex(1)  # Default to FP32
+    layout.addWidget(turbo_decode_combo)
+    win._ui["turbo_decode_dropdown"] = turbo_decode_combo
+
     win.setCentralWidget(central)
     if hasattr(win,"on_generate"):
         win._ui["btn_generate"].clicked.connect(win.on_generate)       # type: ignore
-    win._ui["btn_cancel"].clicked.connect(win.on_cancel_generate)      # type: ignore
-    win._ui["btn_refine"].clicked.connect(win.on_refine)               # type: ignore
-    win._ui["video_preset_combo"].currentTextChanged.connect(win.on_video_preset_changed)  # type: ignore
-    win._ui["width_spin"].valueChanged.connect(win.on_video_dims_manual_changed)  # type: ignore
-    win._ui["height_spin"].valueChanged.connect(win.on_video_dims_manual_changed) # type: ignore
-    if hasattr(win, "on_toggle_remember_output"):
-        win._ui["remember_save_chk"].toggled.connect(win.on_toggle_remember_output)  # type: ignore
-    if hasattr(win, "on_toggle_pipeline_cache"):
-        win._ui["pipeline_cache_chk"].toggled.connect(win.on_toggle_pipeline_cache)  # type: ignore
-    if hasattr(win, "on_toggle_auto_gallery"):
-        win._ui["auto_gallery_chk"].toggled.connect(win.on_toggle_auto_gallery)  # type: ignore
-    if hasattr(win, "on_toggle_auto_refine"):
-        win._ui["auto_refine_chk"].toggled.connect(win.on_toggle_auto_refine)  # type: ignore
+    if hasattr(win, "on_cancel_generate"):
+        win._ui["btn_cancel"].clicked.connect(win.on_cancel_generate)  # type: ignore
+    else:
+        win._ui["btn_cancel"].setEnabled(False)
+    if hasattr(win, "on_refine"):
+        win._ui["btn_refine"].clicked.connect(win.on_refine)       # type: ignore
+    else:
+        win._ui["btn_refine"].setEnabled(False)
+    if hasattr(win, "on_upscale"):
+        win._ui["btn_upscale"].clicked.connect(win.on_upscale)    # type: ignore
+    else:
+        win._ui["btn_upscale"].setEnabled(False)
+    if hasattr(win, "on_upload_image"):
+        win._ui["btn_upload"].clicked.connect(win.on_upload_image)    # type: ignore
+    else:
+        win._ui["btn_upload"].setEnabled(True)
+    # Anatomy Guard signal hookups (no-op if handlers absent)
+    if hasattr(win, "on_apply_anatomy_guard"):
+        win._ui["btn_apply_anatomy_guard"].clicked.connect(win.on_apply_anatomy_guard)  # type: ignore
+    else:
+        win._ui["btn_apply_anatomy_guard"].setEnabled(False)
+    if hasattr(win, "on_toggle_anatomy_guard"):
+        win._ui["anatomy_guard_chk"].toggled.connect(win.on_toggle_anatomy_guard)  # type: ignore
+
+    # Video dimension / preset handlers (optional)
+    if hasattr(win, "on_video_preset_changed"):
+        win._ui["video_preset_combo"].currentTextChanged.connect(win.on_video_preset_changed)  # type: ignore
+    if hasattr(win, "on_video_dims_manual_changed"):
+        win._ui["width_spin"].valueChanged.connect(win.on_video_dims_manual_changed)   # type: ignore
+        win._ui["height_spin"].valueChanged.connect(win.on_video_dims_manual_changed)  # type: ignore
+    else:
+        pass
 
 def _build_docks(win, services: Services) -> None:
     dock_log = QtW.QDockWidget("Log", win)

@@ -8,6 +8,22 @@ import importlib
 import platform
 import torch  # noqa
 
+# --- Telemetry early init patch ---
+try:
+    from src.modules.utils import telemetry as _tel
+    _tel.init_telemetry()
+    from src.modules.utils.telemetry import log_event as _log_event
+    # Dump relevant env flags once
+    _log_event({
+        "event": "startup_env_flags",
+        "flags": {
+            k: v for k, v in os.environ.items()
+            if k.startswith(("SDXL_", "TWO_PHASE_", "VAE_", "FORCE_", "DISABLE_SDXL", "FAST_TWOPHASE"))
+        }
+    })
+except Exception:
+    pass
+
 # Project paths
 CURRENT = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT.parent
@@ -90,6 +106,10 @@ def _auto_set_model(models_root):
         print(f"[AutoModel] Failed: {e}", flush=True)
 
 def main():
+    # Ensure stdout prints show in GUI console
+    import sys
+    sys.stdout = sys.__stdout__
+
     app = QtWidgets.QApplication(sys.argv)
 
     if os.getenv("DISABLE_ENV_SNAPSHOT","0") != "1":
@@ -126,6 +146,34 @@ def main():
             win.statusBar().showMessage(f"Pipeline cache dir: {cache_dir}", 8000)
         except Exception:
             pass
+
+    profile = os.getenv("CIVET_PROFILE")
+    if profile == "sdxl":
+        # Restore SDXL environment settings before pipeline/model load
+        os.environ["SDXL_TWO_PHASE"] = "1"
+        os.environ["DISABLE_SDXL_MANUAL_DECODE"] = "0"
+        os.environ["FAST_TWOPHASE_DECODE"] = "1"
+        os.environ["SDXL_TWO_PHASE_FP32"] = "1"
+        os.environ["SDXL_DISABLE_CHANNELS_LAST_VAE"] = "1"
+        os.environ["SDXL_VAE_SLICING"] = "0"
+        os.environ["SDXL_VAE_TILING"] = "0"
+        os.environ["FORCE_SDXL_VAE_FP32"] = "1"
+        os.environ["DISABLE_SDXL_VAE_FP32"] = "0"
+        os.environ["SDXL_LATENT_RESCUE_AMP"] = "0.8"
+        os.environ["SDXL_LATENT_SCALE_BOOST"] = "3.0"
+        os.environ["SDXL_FORCE_ALT_SCALES"] = "0.18215,0.13025"
+        os.environ["SDXL_TWO_PHASE_MIN_PIX"] = "900000"
+        os.environ["SDXL_TWO_PHASE_AUTO_FALLBACK"] = "1"
+        os.environ["SDXL_LATENT_RESCUE"] = "1"
+        os.environ["SDXL_LATENT_FLAT_STD_THRESH"] = "0.00015"
+        os.environ["SDXL_COLLAPSE_MAX_RESCUES"] = "2"
+        os.environ["SDXL_COLLAPSE_NOISE_STD"] = "0.2"
+        os.environ["SDXL_BLACK_AUTOFIX"] = "1"
+        os.environ["SDXL_BLACK_MEAN_THRESH"] = "0.005"
+        os.environ["SDXL_BLACK_STD_THRESH"] = "0.002"
+        os.environ["SDXL_TWO_PHASE_MAX_FLAT_VARIANTS"] = "2"
+        os.environ["SDXL_TWO_PHASE_FAST_FAIL"] = "1"
+        os.environ["TWO_PHASE_USE_DECODE_LATENTS"] = "1"
 
     code = app.exec()
     try:

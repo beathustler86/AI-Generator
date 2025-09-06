@@ -115,3 +115,6 @@ yarn-error.log
 #!requirements-dev.txt
 #!constraints-gpu.txt
 #!frozen_requirements.txt
+
+# Protected internal modules (do not commit)
+src/modules/chunking_module.py
