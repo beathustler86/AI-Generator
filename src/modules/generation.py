@@ -328,14 +328,33 @@ def _sdxl_fast_decode_latent(pipe, latents: torch.Tensor):
 
 
 # --- Pipeline-native decode helper (preferred) ---
+# Replace _chunked_vae_decode_if_needed with auto-chunking for large shapes
 def _chunked_vae_decode_if_needed(vae, z: torch.Tensor):
     """
     Optionally split latent along height to reduce a very slow monolithic decode.
-      VAE_DECODE_CHUNKS = N (>=1). If 1 => direct decode.
+      VAE_DECODE_CHUNKS:
+        - >=1: use explicit chunks
+        - 'auto' or <=0: auto-pick based on output resolution
     Disables cudnn.benchmark during decode to avoid long per-call algo re-search.
     Emits vae_decode_chunked event.
     """
-    chunks = int(os.getenv("VAE_DECODE_CHUNKS", "1"))
+    chunks_env = os.getenv("VAE_DECODE_CHUNKS", "").strip().lower()
+    try:
+        chunks = int(chunks_env) if chunks_env not in ("", "auto") else 0
+    except Exception:
+        chunks = 0  # auto
+    # Infer output resolution (latents scale 8x for SD/SDXL)
+    B,C,H,W = z.shape
+    out_h = H * 8
+    out_w = W * 8
+    if chunks <= 0:
+        px = out_h * out_w
+        # Heuristic: 720p => 2, 1080p => 3, >=1440p => 4
+        if px >= 2560*1440: chunks = 4
+        elif px >= 1920*1080: chunks = 3
+        elif px >= 1280*720: chunks = 2
+        else: chunks = 1
+
     prev_flag = torch.backends.cudnn.benchmark
     torch.backends.cudnn.benchmark = False
     try:
@@ -348,7 +367,6 @@ def _chunked_vae_decode_if_needed(vae, z: torch.Tensor):
             except Exception:
                 pass
             return out
-        B,C,H,W = z.shape
         base = H // chunks
         rem = H % chunks
         h_cursor = 0
@@ -954,27 +972,27 @@ def _load_pipeline(device:str, sampler:str):
             if not ok:
                 _log_event({"event":"model_validation_failed","target":tgt,"issues":issues})
                 raise RuntimeError(f"Invalid model dir: {issues}")
-        cached=_resolve_cached_path(tgt) if is_local else None
-        load_path=cached or tgt
+        cached = _resolve_cached_path(tgt) if is_local else None
+        load_path = cached or tgt
         if is_local and not ok:
             _log_event({"event":"disk_cache_write_skip","reason":"model_invalid","issues":issues,"slug":_cache_slug_for(tgt)})
         use_cuda=(device=="cuda" and torch.cuda.is_available())
         dtype=torch.float16 if use_cuda else torch.float32
         pipe_cls=_select_pipeline_class(load_path)
         t_from=time.time()
-        pipe=pipe_cls.from_pretrained(load_path,
-                                      torch_dtype=dtype,
-                                      use_safetensors=True,
-                                      low_cpu_mem_usage=True,
-                                      safety_checker=None,
-                                      local_files_only=False)
+        pipe = pipe_cls.from_pretrained(load_path,  # existing line
+                                    torch_dtype=dtype,
+                                    use_safetensors=True,
+                                    low_cpu_mem_usage=True,
+                                    safety_checker=None,
+                                    local_files_only=False)
 
         # --- Model-specific defaults right after load ---
         if "turbo" in tgt.lower():
-            # Dreamshaper XL V2 Turbo
             try:
                 pipe.unet.to(torch.float16)
-                force_vae_fp32 = os.getenv("TURBO_FORCE_VAE_FP32", "1") == "1"
+                # Default to FP16 for Turbo unless explicitly forced to FP32
+                force_vae_fp32 = os.getenv("TURBO_FORCE_VAE_FP32", "0") == "1"
                 if force_vae_fp32:
                     pipe.vae.float()
                 else:
@@ -1034,7 +1052,11 @@ def _load_pipeline(device:str, sampler:str):
         if use_cuda: pipe.to("cuda")
         _log_event({"event":"model_load_phase","phase":"move_to_cuda","ms":int((time.time()-t_move)*1000)})
         _apply_scheduler(pipe, sampler)
-        _PIPELINE,_PIPELINE_DEVICE=pipe,device
+        _PIPELINE, _PIPELINE_DEVICE = pipe, device
+        # Record where we actually loaded from, and whether it was cached
+        global _PIPELINE_LOAD_PATH, _PIPELINE_CACHED
+        _PIPELINE_LOAD_PATH = load_path
+        _PIPELINE_CACHED = bool(cached)
         if is_local and not cached and _DISK_CACHE_ENABLED: _write_disk_pipeline_cache(tgt, pipe)
         _vram_snapshot("post_load", {"model":load_path})
         _maybe_compile(pipe)
@@ -1276,21 +1298,25 @@ def _apply_anatomy_guard(
       ANATOMY_GUARD_POSITIVE_AUG (default 1), ANATOMY_GUARD_AUTO_PORTRAIT (default 0),
       ANATOMY_GUARD_TURBO_CFG_MAX (default 5.5), ANATOMY_GUARD_TURBO_STEPS (default 10).
     """
+    meta: Dict[str, Any] = {"profile": profile, "applied": False}
+    sampler_out = sampler
+
     if os.getenv("ANATOMY_GUARD", "1") != "1":
-        return prompt, negative, steps, cfg, width, height
+        return prompt, negative, steps, cfg, width, height, sampler_out, meta
 
     is_people = _is_people_prompt(prompt) or _is_people_prompt(negative)
     if not is_people:
-        return prompt, negative, steps, cfg, width, height
+        return prompt, negative, steps, cfg, width, height, sampler_out, meta
 
     changed = False
-    meta: Dict[str, Any] = {"profile": profile, "applied": True}
 
+    # Auto portrait when requested
     if os.getenv("ANATOMY_GUARD_AUTO_PORTRAIT", "0") == "1" and width > height:
         width, height = height, width
         changed = True
         meta["auto_portrait"] = True
 
+    # Positive prompt augmentation when requested
     if os.getenv("ANATOMY_GUARD_POSITIVE_AUG", "1") == "1":
         new_prompt = _augment_anatomy_prompt(prompt)
         if new_prompt != prompt:
@@ -1298,32 +1324,59 @@ def _apply_anatomy_guard(
             changed = True
             meta["positive_aug"] = True
 
-    want_sampler = os.getenv("ANATOMY_GUARD_SAMPLER", "dpmpp_2m_karras").strip() or sampler
-    if want_sampler and want_sampler.lower() != (sampler or "").lower():
-        sampler = want_sampler
-        changed = True
-        meta["sampler"] = sampler
-
-    if profile == "turbo":
-        cfg_max = float(os.getenv("ANATOMY_GUARD_TURBO_CFG_MAX", "5.5"))
-        if cfg > cfg_max:
-            cfg = cfg_max
-            changed = True
-            meta["cfg_clamped"] = cfg
-        min_steps = int(os.getenv("ANATOMY_GUARD_TURBO_STEPS", "10"))
-        if steps < min_steps:
-            steps = min_steps
-            changed = True
-            meta["steps_bumped"] = steps
-
+    # Guidance rescale is still useful
     grescale = float(os.getenv("ANATOMY_GUARD_GUIDANCE_RESCALE", "0.7"))
     meta["guidance_rescale"] = max(0.0, min(1.0, grescale))
 
+    if profile == "turbo":
+        # Performance-preserving rules for Turbo:
+        # - Do NOT override the sampler (keep user's fast choice, e.g., euler_a)
+        # - Do NOT bump steps above the turbo cap
+        try:
+            cap = int(os.getenv("TURBO_STEPS_CAP", "8"))
+        except Exception:
+            cap = 8
+        new_steps = min(steps, cap)
+        if new_steps != steps:
+            steps = new_steps
+            changed = True
+            meta["steps_clamped"] = steps
+
+        # Optional: clamp cfg to turbo max if requested, but avoid bumps
+        try:
+            cfg_max = float(os.getenv("ANATOMY_GUARD_TURBO_CFG_MAX", "5.5"))
+            if cfg > cfg_max:
+                cfg = cfg_max
+                changed = True
+                meta["cfg_clamped"] = cfg
+        except Exception:
+            pass
+
+    else:
+        # Non-Turbo: allow sampler override if explicitly requested
+        want_sampler = os.getenv("ANATOMY_GUARD_SAMPLER", "dpmpp_2m_karras").strip() or sampler
+        if want_sampler and want_sampler.lower() != (sampler or "").lower():
+            sampler_out = want_sampler
+            changed = True
+            meta["sampler"] = sampler_out
+
+        # For non‑turbo we keep the original min-steps logic only if it would reduce steps
+        try:
+            min_steps = int(os.getenv("ANATOMY_GUARD_TURBO_STEPS", "10"))
+            if steps < min_steps:
+                steps = min_steps
+                changed = True
+                meta["steps_bumped"] = steps
+        except Exception:
+            pass
+
+    meta["applied"] = True
     if changed:
         _log_event({"event": "anatomy_guard_applied", **meta})
     else:
         _log_event({"event": "anatomy_guard_detected_people_nochange", **meta})
-    return prompt, negative, steps, cfg, width, height, sampler, meta
+
+    return prompt, negative, steps, cfg, width, height, sampler_out, meta
 
 # --- Generation toggles / helpers needed by loader and run ---
 def _should_use_bf16(pipe_cls: Any, target: str) -> bool:
@@ -1513,6 +1566,16 @@ def generate_images(
     images: List[Any]=[]
     step_durations=[]
 
+    # Diffusers step callback for cancel + progress
+    def _cb(step: int, timestep: int, latents):
+        if cancel_event and cancel_event.is_set():
+            raise RuntimeError("cancelled")
+        try:
+            if progress_cb and step % max(1, steps // 10 or 1) == 0:
+                progress_cb(f"Sampling step {step}/{steps}")
+        except Exception:
+            pass
+
     with torch.inference_mode():
         for b in range(batch):
             if cancel_event and cancel_event.is_set(): raise RuntimeError("cancelled")
@@ -1523,9 +1586,8 @@ def generate_images(
                 g=torch.Generator(device=device if (device=="cuda" and torch.cuda.is_available()) else "cpu")
                 g.manual_seed(seed+b)
             if progress_cb and b>0: progress_cb(f"Batch {b+1}/{batch}")
-            cb=None
             gen_kwargs=dict(num_inference_steps=steps,guidance_scale=cfg,width=width,height=height,
-                            generator=g,callback=cb,callback_steps=1)
+                            generator=g,callback=_cb,callback_steps=1)
             try:
                 gres = float(anat_meta.get("guidance_rescale", 0.0)) if isinstance(anat_meta, dict) else 0.0
                 if gres > 0.0:
@@ -1617,3 +1679,42 @@ def has_pipeline() -> bool:
 
 def disk_cache_root() -> str:
     return str(PIPELINE_DISK_CACHE_DIR)
+
+# Add near other globals (after _PIPELINE/_PIPELINE_DEVICE declarations)
+try:
+    _PIPELINE_LOAD_PATH  # type: ignore
+except NameError:
+    _PIPELINE_LOAD_PATH: Optional[str] = None
+
+try:
+    _PIPELINE_CACHED  # type: ignore
+except NameError:
+    _PIPELINE_CACHED: bool = False
+
+def current_pipeline_load_path() -> Optional[str]:
+    """
+    Returns the actual path that was used to load the current pipeline.
+    When disk cache is used, this points into PIPELINE_DISK_CACHE_DIR.
+    """
+    return _PIPELINE_LOAD_PATH
+
+def is_pipeline_ready(device: Optional[str] = "cuda") -> bool:
+    """
+    True if a pipeline is already in memory, and (optionally) on the requested device.
+    """
+    return (_PIPELINE is not None) and (device is None or _PIPELINE_DEVICE == device)
+
+def pipeline_from_disk_cache() -> bool:
+    """
+    True if the currently loaded pipeline originated from the disk cache.
+    """
+    try:
+        if _PIPELINE_CACHED:
+            return True
+        lp = current_pipeline_load_path()
+        if not lp:
+            return False
+        root = str(PIPELINE_DISK_CACHE_DIR).replace("\\", "/")
+        return str(lp).replace("\\", "/").startswith(root + "/")
+    except Exception:
+        return False

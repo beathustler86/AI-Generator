@@ -13,8 +13,8 @@ except ImportError:
     confirm_launch = confirm_close = log_event = lambda *a, **k: None
 
 # --- Model weights directory ---
-# Use absolute path for your setup
-UPSCALE_WEIGHTS_DIR = Path(r"F:\SoftwareDevelopment\AI Models Image\AIGenerator\models\Upscaler\Real-ESRGAN\weights")
+# Use absolute path for your setup (matches your tree on F:)
+UPSCALE_WEIGHTS_DIR = Path(r"F:\SoftwareDevelopment\AI Models Image\AIGenerator\models\upscaler\Real-ESRGAN\weights")
 
 # Supported models (add more as needed)
 UPSCALE_MODEL_PATHS = {
@@ -31,9 +31,16 @@ MODEL_INTERNAL = {
 }
 
 # --- RRDBNet import ---
-rrdb_path = UPSCALE_WEIGHTS_DIR.parent.parent / "Real-ESRGAN" / "realesrgan" / "archs" / "rrdbnet_arch.py"
+# Repo root is the parent of the weights directory:
+# ...\models\upscaler\Real-ESRGAN\weights -> repo root = ...\models\upscaler\Real-ESRGAN
+repo_root = UPSCALE_WEIGHTS_DIR.parent
+rrdb_path = repo_root / "realesrgan" / "archs" / "rrdbnet_arch.py"
+if not rrdb_path.exists():
+    raise FileNotFoundError(f"RRDBNet arch not found at: {rrdb_path}")
+
 spec = importlib.util.spec_from_file_location("rrdbnet", str(rrdb_path))
 rrdbnet = importlib.util.module_from_spec(spec)
+assert spec and spec.loader, "Failed to create import spec for rrdbnet"
 spec.loader.exec_module(rrdbnet)
 
 RRDBNet = rrdbnet.RRDBNet
@@ -190,7 +197,7 @@ if __name__ == "__main__":
     print("[Main] Starting test upscale...")
 
     try:
-        test_image_path = r"F:\SoftwareDevelopment\AI Models Image\AIGenerator\models\Upscaler\Real-ESRGAN\inputs\0014.jpg"
+        test_image_path = str(repo_root / "inputs" / "0014.jpg")
         image = Image.open(test_image_path)
 
         result = upscale_image_pass(

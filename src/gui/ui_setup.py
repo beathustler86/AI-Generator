@@ -218,12 +218,22 @@ def _build_central(win, services: Services) -> None:
     win._ui["preview_label"].setFrameShape(QtW.QFrame.Shape.StyledPanel)
     layout.addWidget(win._ui["preview_label"], 1)
 
+    # --- Bottom row ---
     btn_row = _hbox([])
     win._ui["btn_generate"] = QtW.QPushButton("Generate"); win._ui["btn_generate"].setVisible(False)
     win._ui["btn_cancel"] = QtW.QPushButton("Cancel"); win._ui["btn_cancel"].setEnabled(False)
     win._ui["btn_refine"] = QtW.QPushButton("Refine"); win._ui["btn_refine"].setEnabled(False)
+    win._ui["btn_save_image"] = QtW.QPushButton("Save")
+    win._ui["btn_save_image_as"] = QtW.QPushButton("Save As...")
+    win._ui["btn_save_video"] = QtW.QPushButton("Save Video")
+    win._ui["btn_save_video_as"] = QtW.QPushButton("Save Video As...")
+
     btn_row.addWidget(win._ui["btn_cancel"])
     btn_row.addWidget(win._ui["btn_refine"])
+    btn_row.addWidget(win._ui["btn_save_image"])
+    btn_row.addWidget(win._ui["btn_save_image_as"])
+    btn_row.addWidget(win._ui["btn_save_video"])
+    btn_row.addWidget(win._ui["btn_save_video_as"])
 
     # Anatomy Guard controls (additive, safe)
     anat_chk = QtW.QCheckBox("Anatomy Guard")
@@ -239,9 +249,7 @@ def _build_central(win, services: Services) -> None:
     win._ui["auto_refine_chk"] = auto_refine_chk
     btn_row.addWidget(auto_refine_chk)
 
-    btn_row.addStretch(1)
-    layout.addLayout(btn_row)
-
+    # Remember/cache/gallery
     remember_chk = QtW.QCheckBox("Remember save location")
     win._ui["remember_save_chk"] = remember_chk
     btn_row.addWidget(remember_chk)
@@ -251,6 +259,9 @@ def _build_central(win, services: Services) -> None:
     auto_gallery_chk = QtW.QCheckBox("Auto save to gallery")
     win._ui["auto_gallery_chk"] = auto_gallery_chk
     btn_row.addWidget(auto_gallery_chk)
+
+    btn_row.addStretch(1)
+    layout.addLayout(btn_row)
 
     precision_label = QtW.QLabel("Precision:")
     layout.addWidget(precision_label)
@@ -290,6 +301,17 @@ def _build_central(win, services: Services) -> None:
         win._ui["btn_upload"].clicked.connect(win.on_upload_image)    # type: ignore
     else:
         win._ui["btn_upload"].setEnabled(True)
+
+    # Wire save buttons (if handlers exist)
+    if hasattr(win, "on_save_image"):
+        win._ui["btn_save_image"].clicked.connect(win.on_save_image)    # type: ignore
+    if hasattr(win, "on_save_image_as"):
+        win._ui["btn_save_image_as"].clicked.connect(win.on_save_image_as)  # type: ignore
+    if hasattr(win, "on_save_video"):
+        win._ui["btn_save_video"].clicked.connect(win.on_save_video)    # type: ignore
+    if hasattr(win, "on_save_video_as"):
+        win._ui["btn_save_video_as"].clicked.connect(win.on_save_video_as)  # type: ignore
+
     # Anatomy Guard signal hookups (no-op if handlers absent)
     if hasattr(win, "on_apply_anatomy_guard"):
         win._ui["btn_apply_anatomy_guard"].clicked.connect(win.on_apply_anatomy_guard)  # type: ignore

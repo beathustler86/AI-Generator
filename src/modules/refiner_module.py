@@ -19,6 +19,7 @@ Environment variables:
   SDXL_REFINER_VARIANT     'fp16' / 'fp32' / etc. (default fp16)
   SDXL_REFINER_XFORMERS=1  Enable memory‑efficient attention if available (default 1)
   SDXL_REFINER_STRENGTH    RGB fallback strength (default 0.35)
+  SDXL_REFINER_GUIDANCE    RGB fallback guidance scale (default 3.5)
   SDXL_REFINER_ASYNC=1     Allow background async loading (default 1)
 """
 
@@ -28,13 +29,29 @@ from datetime import datetime
 from typing import Optional, Any, Dict, Tuple
 import torch
 from PIL import Image
+import contextlib
 
 try:
     from diffusers import StableDiffusionXLRefinerPipeline  # type: ignore
-    _IMPORTABLE = True
+    _HAS_SDXL_REFINER = True
 except Exception:
     StableDiffusionXLRefinerPipeline = None  # type: ignore
-    _IMPORTABLE = False
+    _HAS_SDXL_REFINER = False
+
+# Auto pipeline fallback (covers builds where refiner class isn't top-level-exported)
+try:
+    from diffusers import AutoPipelineForImage2Image  # type: ignore
+    _HAS_AUTO_I2I = True
+except Exception:
+    AutoPipelineForImage2Image = None  # type: ignore
+    _HAS_AUTO_I2I = False
+
+# Img2Img fallbacks (no refiner)
+try:
+    from diffusers import StableDiffusionXLImg2ImgPipeline, StableDiffusionImg2ImgPipeline  # type: ignore
+except Exception:
+    StableDiffusionXLImg2ImgPipeline = None  # type: ignore
+    StableDiffusionImg2ImgPipeline = None  # type: ignore
 
 # ---------- Paths / Config ----------
 _REPO_DEFAULT = "F:/SoftwareDevelopment/AI Models Image/AIGenerator/models/text_to_image/stable-diffusion-xl-refiner-1.0"
@@ -42,6 +59,7 @@ REFINER_PATH = os.environ.get("SDXL_REFINER_PATH", _REPO_DEFAULT)
 _SPLIT_DEF = float(os.environ.get("SDXL_REFINER_SPLIT", "0.8"))
 _STEPS_DEF = int(os.environ.get("SDXL_REFINER_STEPS", "6"))
 _STRENGTH_DEF = float(os.environ.get("SDXL_REFINER_STRENGTH", "0.35"))
+_GUIDANCE_DEF = float(os.environ.get("SDXL_REFINER_GUIDANCE", "3.5"))
 _ASYNC = os.environ.get("SDXL_REFINER_ASYNC", "1") == "1"
 
 # ---------- Telemetry helpers ----------
@@ -75,9 +93,12 @@ _device: Optional[str] = None
 _dtype: Optional[torch.dtype] = None
 _async_thread: Optional[threading.Thread] = None
 
+_IMPORTABLE = bool(_HAS_SDXL_REFINER or _HAS_AUTO_I2I)
+
 # ---------- Core Helpers ----------
 def available() -> bool:
-    return _IMPORTABLE and os.path.isdir(REFINER_PATH)
+    # Path exists AND we have either the native refiner class or AutoPipeline fallback
+    return os.path.isdir(REFINER_PATH) and (_HAS_SDXL_REFINER or _HAS_AUTO_I2I)
 
 def has_refiner() -> bool:
     return _pipe is not None or available()
@@ -96,11 +117,116 @@ def _enable_xformers(pipe):
     except Exception as e:
         _log_exception(e, "refiner_xformers")
 
+def _enable_tf32():
+    try:
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            # Prefer faster matmul kernels on Ampere+
+            with contextlib.suppress(Exception):
+                torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
+def _get_active_pipeline():
+    # Try to reuse the currently loaded generation pipeline (for Img2Img fallback)
+    try:
+        from src.modules import generation as gen_mod  # type: ignore
+        return getattr(gen_mod, "_PIPELINE", None)
+    except Exception:
+        return None
+
+def _pil_cleanup(image: Image.Image) -> Image.Image:
+    # Gentle cleanup: autocontrast -> median denoise -> unsharp mask
+    try:
+        from PIL import ImageFilter, ImageOps
+        img = image.convert("RGB")
+        img = ImageOps.autocontrast(img, cutoff=1)  # clip 1% for mild contrast fix
+        img = img.filter(ImageFilter.MedianFilter(size=3))  # mild denoise
+        img = img.filter(ImageFilter.UnsharpMask(radius=1.2, percent=120, threshold=3))  # subtle sharpening
+        return img
+    except Exception as e:
+        _log_exception(e, "pil_cleanup")
+        return image
+
+def _fallback_img2img(
+    image: Image.Image,
+    prompt: str,
+    negative_prompt: Optional[str],
+    steps: int,
+    strength: float,
+    guidance_scale: float
+) -> Optional[Image.Image]:
+    """
+    Build an Img2Img pipeline from the active T2I pipeline components and run a low-strength cleanup pass.
+    """
+    pipe = _get_active_pipeline()
+    if pipe is None:
+        _log("refiner_img2img_no_active_pipe")
+        return None
+
+    # Resolve device/dtype from UNet if possible
+    try:
+        ref_param = next(pipe.unet.parameters())
+        dev = "cuda" if ref_param.is_cuda else "cpu"
+        dt = ref_param.dtype
+    except Exception:
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        dt = torch.float16 if dev == "cuda" else torch.float32
+
+    # Pick proper Img2Img class
+    try:
+        from diffusers import StableDiffusionXLPipeline, StableDiffusionPipeline  # type: ignore
+        is_xl = isinstance(pipe, StableDiffusionXLPipeline)
+    except Exception:
+        is_xl = hasattr(pipe, "text_encoder_2")  # heuristic
+
+    img2img_cls = StableDiffusionXLImg2ImgPipeline if is_xl else StableDiffusionImg2ImgPipeline
+    if img2img_cls is None:
+        _log("refiner_img2img_class_missing", is_xl=is_xl)
+        return None
+
+    t0 = time.time()
+    try:
+        # Construct from components to avoid reloading weights
+        img2img = img2img_cls(**pipe.components)  # type: ignore[arg-type]
+        img2img = img2img.to(dev)
+        # Keep dtype alignment to avoid casts
+        with torch.inference_mode():
+            try:
+                # Some pipelines support full .to(dtype=)
+                img2img.to(dtype=dt)
+            except Exception:
+                pass
+        _enable_xformers(img2img)
+
+        # Run cleanup pass
+        with torch.inference_mode():
+            out = img2img(
+                prompt=prompt or "",
+                negative_prompt=negative_prompt,
+                image=image.convert("RGB"),
+                strength=float(max(0.05, min(0.95, strength))),
+                num_inference_steps=int(max(1, steps)),
+                guidance_scale=float(max(0.0, guidance_scale))
+            )
+        res = out.images[0] if hasattr(out, "images") and out.images else None
+        if res is not None:
+            _log("refiner_rgb_fallback_img2img_ok",
+                 is_xl=is_xl, steps=steps, strength=strength, guidance=guidance_scale,
+                 ms=int((time.time()-t0)*1000))
+        else:
+            _log("refiner_rgb_fallback_img2img_empty")
+        return res
+    except Exception as e:
+        _log_exception(e, "refiner_img2img_run")
+        return None
+
 # ---------- Load ----------
 def load_refiner(force: bool = False):
     global _pipe, _device, _dtype
-    if not available():
-        _log("refiner_unavailable", path=REFINER_PATH, importable=_IMPORTABLE)
+    if not os.path.isdir(REFINER_PATH):
+        _log("refiner_unavailable", path=REFINER_PATH, importable=False)
         return None
     with _lock:
         if _pipe is not None and not force:
@@ -109,14 +235,31 @@ def load_refiner(force: bool = False):
         variant = os.environ.get("SDXL_REFINER_VARIANT", "fp16")
         t0 = time.time()
         try:
-            pipe = StableDiffusionXLRefinerPipeline.from_pretrained(
-                REFINER_PATH,
-                torch_dtype=dt,
-                use_safetensors=True,
-                safety_checker=None,
-                variant=variant
-            )
+            if _HAS_SDXL_REFINER and StableDiffusionXLRefinerPipeline is not None:
+                pipe = StableDiffusionXLRefinerPipeline.from_pretrained(
+                    REFINER_PATH,
+                    torch_dtype=dt,
+                    use_safetensors=True,
+                    safety_checker=None,
+                    variant=variant,
+                    low_cpu_mem_usage=True,
+                    local_files_only=True
+                )
+            elif _HAS_AUTO_I2I and AutoPipelineForImage2Image is not None:
+                pipe = AutoPipelineForImage2Image.from_pretrained(
+                    REFINER_PATH,
+                    torch_dtype=dt,
+                    use_safetensors=True,
+                    variant=variant,
+                    low_cpu_mem_usage=True,
+                    local_files_only=True
+                )
+            else:
+                _log("refiner_no_loader_available")
+                return None
+
             if dev == "cuda":
+                _enable_tf32()
                 pipe.to(dev)
             _enable_xformers(pipe)
             _pipe = pipe
@@ -195,10 +338,33 @@ def refine_image_from_rgb(
     steps: int = 10,
     strength: float = 0.3
 ):
+    """
+    Preferred: use SDXL Refiner if available.
+    Fallback: Img2Img with the active pipeline (low-strength cleanup).
+    Final fallback: gentle PIL cleanup (autocontrast/denoise/sharpen).
+    """
     pipe = load_refiner()
     if pipe is None:
         _log("refiner_rgb_no_pipe")
-        return image
+        # Try Img2Img fallback using active pipeline
+        img2img_steps = int(os.environ.get("SDXL_REFINER_STEPS", str(max(1, steps))))
+        img2img_strength = float(os.environ.get("SDXL_REFINER_STRENGTH", str(max(0.05, min(0.95, strength)))))
+        img2img_guidance = float(os.environ.get("SDXL_REFINER_GUIDANCE", str(_GUIDANCE_DEF)))
+        res = _fallback_img2img(
+            image=image,
+            prompt=prompt or "",
+            negative_prompt=negative_prompt,
+            steps=img2img_steps,
+            strength=img2img_strength,
+            guidance_scale=img2img_guidance
+        )
+        if res is not None:
+            return res
+        # Last-resort PIL cleanup
+        cleaned = _pil_cleanup(image)
+        _log("refiner_rgb_fallback_pil_ok")
+        return cleaned
+
     if image.mode != "RGB":
         image = image.convert("RGB")
     t0 = time.time()
@@ -216,20 +382,32 @@ def refine_image_from_rgb(
         return res
     except Exception as e:
         _log_exception(e, "refiner_rgb")
-        return image
+        # Attempt Img2Img fallback even if refiner load failed at run time
+        res = _fallback_img2img(
+            image=image,
+            prompt=prompt or "",
+            negative_prompt=negative_prompt,
+            steps=int(max(1, steps)),
+            strength=float(max(0.05, min(0.95, strength))),
+            guidance_scale=_GUIDANCE_DEF
+        )
+        if res is not None:
+            return res
+        return _pil_cleanup(image)
 
 # ---------- Back-compat UI Wrapper ----------
-def refine_image(image, prompt=None, negative=None, **kw):
+def refine_image(image, prompt=None, negative=None, **_kw_unused):
     """
     Returns dict: {"image": PIL.Image or None}
+    Uses recommended defaults for cleanup when refiner is unavailable.
     """
     try:
         out_img = refine_image_from_rgb(
             image,
             prompt=prompt or "",
             negative_prompt=negative,
-            steps=int(os.getenv("SDXL_REFINER_STEPS", str(_STEPS_DEF))),
-            strength=float(os.getenv("SDXL_REFINER_STRENGTH", str(_STRENGTH_DEF)))
+            steps=int(os.getenv("SDXL_REFINER_STEPS", "10")),
+            strength=float(os.getenv("SDXL_REFINER_STRENGTH", "0.35"))
         )
         return {"image": out_img}
     except Exception as e:
@@ -244,7 +422,7 @@ def status() -> Dict[str, Any]:
         "device": _device,
         "dtype": str(_dtype),
         "path": REFINER_PATH,
-        "importable": _IMPORTABLE,
+        "importable": _IMPORTABLE,  # now defined
         "ts": _now()
     }
 

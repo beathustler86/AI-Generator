@@ -1,5 +1,14 @@
 from typing import List, Optional
 
+# Telemetry (safe fallback if unavailable)
+try:
+    from src.modules.utils.telemetry import log_event, log_exception
+except Exception:
+    def log_event(data):  # type: ignore
+        pass
+    def log_exception(e, context: Optional[str] = None):  # type: ignore
+        pass
+
 class ChunkingError(Exception):
     """Custom exception for chunking errors."""
     pass
@@ -34,6 +43,42 @@ def _max_tokens_for(tokenizer, default: int = 77, reserve_special: int = 2) -> i
     eff = max(8, model_max - int(reserve_special))
     return eff
 
+def _emit_chunk_telemetry(chunks: List[str], mode: str, eff_max: int, tokenizer) -> None:
+    """
+    Emits a telemetry event describing the produced chunks.
+    Includes per-chunk token/word lengths and optional previews.
+    """
+    try:
+        import os, contextlib
+        lengths: List[int] = []
+        if tokenizer is not None:
+            for ch in chunks:
+                try:
+                    lengths.append(len(tokenizer.encode(ch, add_special_tokens=False)))
+                except TypeError:
+                    lengths.append(len(tokenizer.encode(ch)))
+        else:
+            lengths = [len((ch or "").split()) for ch in chunks]
+
+        payload = None
+        if os.environ.get("CHUNK_TRACE_PAYLOAD", "0") == "1":
+            # Include a short preview to avoid log bloat
+            payload = [ch[:160] for ch in chunks]
+
+        data = {
+            "event": "chunk_text",
+            "mode": mode,
+            "max_tokens": eff_max,
+            "chunks_count": len(chunks),
+            "lengths": lengths,
+        }
+        if payload is not None:
+            data["chunks"] = payload
+        log_event(data)
+    except Exception as e:
+        with contextlib.suppress(Exception):
+            log_exception(e, context="chunk_telemetry")
+
 def chunk_text(
     text: str,
     max_tokens: Optional[int] = None,
@@ -67,7 +112,9 @@ def chunk_text(
                 chunk = tokenizer.decode(chunk_toks).strip()
             if chunk:
                 chunks.append(chunk)
-        return chunks if chunks else [text.strip()]
+        chunks = chunks if chunks else [text.strip()]
+        _emit_chunk_telemetry(chunks, mode="token", eff_max=eff_max, tokenizer=tokenizer)
+        return chunks
     else:
         # Fallback: naive word-based chunking
         words = (text or "").split()
@@ -78,7 +125,9 @@ def chunk_text(
             chunk = " ".join(words[i:i+eff_max]).strip()
             if chunk:
                 chunks.append(chunk)
-        return chunks if chunks else [text.strip()]
+        chunks = chunks if chunks else [text.strip()]
+        _emit_chunk_telemetry(chunks, mode="word", eff_max=eff_max, tokenizer=None)
+        return chunks
 
 def is_within_token_limit(
     text: str,

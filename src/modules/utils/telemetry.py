@@ -111,18 +111,24 @@ def install_threading_excepthook():
                 orig(args)
         threading.excepthook = _thook
 
-def init_telemetry():
+def init_telemetry(truncate: Optional[bool] = None):
     global _LOG_FILE, _FH
     if _LOG_FILE:
         return
-    from pathlib import Path
-    log_dir = Path("logs")
+    # Use project-root logs directory consistently
+    log_dir = _LOG_DIR
     log_dir.mkdir(parents=True, exist_ok=True)
     _LOG_FILE = log_dir / "telemetry.log"
-    # Append instead of overwrite; line buffered
-    _FH = open(_LOG_FILE, "a", encoding="utf-8", buffering=1)
+
+    # Truncate by default; allow opt-out via TELEMETRY_FRESH=0
+    if truncate is None:
+        env = os.environ.get("TELEMETRY_FRESH", "1")
+        truncate = env not in ("0", "false", "False")
+
+    mode = "w" if truncate else "a"
+    _FH = open(_LOG_FILE, mode, encoding="utf-8", buffering=1)  # line-buffered
     atexit.register(_flush_telemetry)
-    _emit({"event":"telemetry_init","file":str(_LOG_FILE)})
+    _emit({"event": "telemetry_init", "file": str(_LOG_FILE)})
 
 def _flush_telemetry():
     try:
